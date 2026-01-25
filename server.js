@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs/promises";
+import { createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
 import path from "path";
 import os from "os";
 
@@ -82,7 +84,6 @@ async function listAllUploadKeys() {
   return keys;
 }
 
-
 // STEP 5) helper: read Notion property "Prompt"
 async function getNotionPrompt() {
   if (!NOTION_API_KEY) throw new Error("Missing env var: NOTION_API_KEY");
@@ -117,29 +118,30 @@ function buildPublicVideoUrl(key) {
   return `${base}/${safeKey}`;
 }
 
-// STEP 7) helper: download video to /tmp
+// STEP 7) helper: download video to /tmp (STREAMING, low memory)
 async function downloadToTempFile(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download video (${res.status})`);
-
-  const arrayBuffer = await res.arrayBuffer();
-  const buf = Buffer.from(arrayBuffer);
+  if (!res.body) throw new Error("No response body to stream");
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-"));
   const videoPath = path.join(tmpDir, "input.mp4");
-  await fs.writeFile(videoPath, buf);
+
+  // Stream MP4 directly to disk (avoids loading entire file into RAM)
+  await pipeline(res.body, createWriteStream(videoPath));
 
   return { tmpDir, videoPath };
 }
 
-// STEP 8) helper: extract frames (base64 images) using ffmpeg
-async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 12 } = {}) {
+// STEP 8) helper: extract frames (base64 images) using ffmpeg (SMALLER + FEWER)
+async function extractFramesBase64(videoPath, { fps = 0.5, maxFrames = 4 } = {}) {
   const framesDir = path.join(path.dirname(videoPath), "frames");
   await fs.mkdir(framesDir, { recursive: true });
 
   await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
-      .outputOptions([`-vf fps=${fps}`, "-q:v 3"])
+      // scale down frames + lower JPEG quality = much smaller memory/payload
+      .outputOptions([`-vf fps=${fps},scale=512:-1`, "-q:v 8"])
       .output(path.join(framesDir, "frame-%03d.jpg"))
       .on("end", resolve)
       .on("error", reject)
@@ -221,13 +223,6 @@ function safeJsonFromText(text) {
 
 /**
  * STEP 11) ✅ save to Airtable (FULLY DYNAMIC, TEXT ONLY)
- * - Sends ONLY the keys ChatGPT returns
- * - Arrays → "a, b, c"
- * - Strings → "text"
- * - Skips empty values
- *
- * REQUIREMENT:
- * Airtable must already have text columns with matching names
  */
 function toText(val) {
   if (Array.isArray(val)) return val.map(String).filter(Boolean).join(", ");
@@ -244,20 +239,15 @@ async function createAirtableRow({ videoUrl, tagsObj }) {
     AIRTABLE_TABLE_NAME
   )}`;
 
-  // ✅ build fields dynamically
-  const fields = {
-    video_url: toText(videoUrl),
-  };
+  const fields = { video_url: toText(videoUrl) };
 
   for (const [key, value] of Object.entries(tagsObj || {})) {
     const text = toText(value);
-    if (!text) continue; // skip empty values
+    if (!text) continue;
     fields[key] = text;
   }
 
-  const body = {
-    records: [{ fields }],
-  };
+  const body = { records: [{ fields }] };
 
   const resp = await fetch(url, {
     method: "POST",
@@ -315,8 +305,6 @@ async function getAllAirtableVideoUrls() {
   return urls;
 }
 
-
-
 // STEP 12) health check
 app.get("/", (_req, res) => {
   console.log("Health check hit");
@@ -330,12 +318,10 @@ app.post("/webhook", async (_req, res) => {
   try {
     console.log("🔥 WEBHOOK CAPTURED (BATCH MODE)");
 
-    // 1) Notion Prompt (same as before)
     console.log("Retrieving Notion page Prompt...");
     const promptText = await getNotionPrompt();
     console.log("🧠 NOTION PROMPT:", promptText);
 
-    // 2) List ALL R2 keys
     console.log("Listing ALL upload keys from R2...");
     const allKeys = await listAllUploadKeys();
     if (!allKeys.length) {
@@ -344,26 +330,21 @@ app.post("/webhook", async (_req, res) => {
     }
     console.log(`📦 Found ${allKeys.length} objects in R2`);
 
-    // 3) Build ALL public URLs
     const allUrls = allKeys.map(buildPublicVideoUrl);
 
-    // 4) Get all Airtable video_url values
     console.log("Fetching Airtable existing video_url values...");
     const existingUrls = await getAllAirtableVideoUrls();
     const existingSet = new Set(existingUrls);
     console.log(`📌 Airtable has ${existingUrls.length} video_url entries`);
 
-    // 5) Diff (new URLs only)
     const newUrls = allUrls.filter((u) => !existingSet.has(u));
     console.log(`🆕 New URLs to tag: ${newUrls.length}`);
 
-    // Optional: limit per run to avoid timeouts/cost
     const LIMIT = Number(process.env.BATCH_LIMIT || 10);
     const toProcess = newUrls.slice(0, LIMIT);
 
     const results = [];
 
-    // 6) Process ONE BY ONE (your exact existing pipeline)
     for (const videoUrl of toProcess) {
       console.log("====================================");
       console.log("🌐 PROCESSING:", videoUrl);
@@ -374,10 +355,7 @@ app.post("/webhook", async (_req, res) => {
         tmpDir = dl.tmpDir;
 
         console.log("🖼️ Extracting frames...");
-        const framesBase64 = await extractFramesBase64(dl.videoPath, {
-          fps: 1,
-          maxFrames: 12,
-        });
+        const framesBase64 = await extractFramesBase64(dl.videoPath);
         console.log(`✅ Extracted ${framesBase64.length} frames`);
 
         console.log("🤖 Sending frames + prompt to OpenAI...");
@@ -386,6 +364,10 @@ app.post("/webhook", async (_req, res) => {
           framesBase64,
           videoUrl,
         });
+
+        // Help GC: drop big arrays ASAP
+        framesBase64.length = 0;
+
         console.log("✅ OPENAI RAW TEXT:", analysisText);
 
         const tagsObj = safeJsonFromText(analysisText);
@@ -431,7 +413,6 @@ app.post("/webhook", async (_req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
-
 
 // STEP 14) start server
 const port = process.env.PORT || 3000;
