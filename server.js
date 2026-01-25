@@ -54,20 +54,34 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-// STEP 4) helper: get latest uploaded object KEY only
-async function getLatestUploadKey() {
-  const command = new ListObjectsV2Command({
-    Bucket: R2_BUCKET_NAME,
-    MaxKeys: 1000,
-  });
+// STEP 4) helper: list ALL object KEYS (paginated)
+async function listAllUploadKeys() {
+  const keys = [];
+  let ContinuationToken = undefined;
 
-  const response = await r2.send(command);
-  const files = response.Contents || [];
-  if (files.length === 0) return null;
+  while (true) {
+    const command = new ListObjectsV2Command({
+      Bucket: R2_BUCKET_NAME,
+      MaxKeys: 1000,
+      ContinuationToken,
+      // If you already upload into a folder, optionally add:
+      // Prefix: "your-folder/",
+    });
 
-  files.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
-  return files[0].Key;
+    const response = await r2.send(command);
+    const files = response.Contents || [];
+
+    for (const f of files) {
+      if (f?.Key) keys.push(f.Key);
+    }
+
+    if (!response.IsTruncated) break;
+    ContinuationToken = response.NextContinuationToken;
+  }
+
+  return keys;
 }
+
 
 // STEP 5) helper: read Notion property "Prompt"
 async function getNotionPrompt() {
@@ -261,6 +275,46 @@ async function createAirtableRow({ videoUrl, tagsObj }) {
   return data;
 }
 
+// STEP 11.5) ✅ NEW: get ALL video_url values from Airtable (for diff)
+async function getAllAirtableVideoUrls() {
+  if (!AIRTABLE_API_KEY) throw new Error("Missing env var: AIRTABLE_API_KEY");
+  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
+  if (!AIRTABLE_TABLE_NAME) throw new Error("Missing env var: AIRTABLE_TABLE_NAME");
+
+  const baseUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+    AIRTABLE_TABLE_NAME
+  )}`;
+
+  const urls = [];
+  let offset = undefined;
+
+  while (true) {
+    const url = new URL(baseUrl);
+    url.searchParams.append("fields[]", "video_url");
+    url.searchParams.set("pageSize", "100");
+    if (offset) url.searchParams.set("offset", offset);
+
+    const resp = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(`Airtable read error: ${resp.status} ${JSON.stringify(data)}`);
+    }
+
+    for (const rec of data.records || []) {
+      const v = rec?.fields?.video_url;
+      if (v) urls.push(String(v).trim());
+    }
+
+    if (!data.offset) break;
+    offset = data.offset;
+  }
+
+  return urls;
+}
+
 
 
 // STEP 12) health check
@@ -274,75 +328,110 @@ app.post("/webhook", async (_req, res) => {
   let tmpDir = null;
 
   try {
-    console.log("🔥 WEBHOOK CAPTURED");
+    console.log("🔥 WEBHOOK CAPTURED (BATCH MODE)");
 
-    // 1) Notion Prompt
+    // 1) Notion Prompt (same as before)
     console.log("Retrieving Notion page Prompt...");
     const promptText = await getNotionPrompt();
     console.log("🧠 NOTION PROMPT:", promptText);
 
-    // 2) Latest R2 key
-    console.log("Retrieving latest upload key from R2...");
-    const latestKey = await getLatestUploadKey();
-    if (!latestKey) {
+    // 2) List ALL R2 keys
+    console.log("Listing ALL upload keys from R2...");
+    const allKeys = await listAllUploadKeys();
+    if (!allKeys.length) {
       console.log("⚠️ No files found in bucket");
       return res.status(404).json({ ok: false, error: "Bucket empty" });
     }
-    console.log("📄 LATEST FILE KEY:", latestKey);
+    console.log(`📦 Found ${allKeys.length} objects in R2`);
 
-    // 3) Build public URL
-    const videoUrl = buildPublicVideoUrl(latestKey);
-    console.log("🌐 VIDEO URL:", videoUrl);
+    // 3) Build ALL public URLs
+    const allUrls = allKeys.map(buildPublicVideoUrl);
 
-    // 4) Download + extract frames
-    console.log("⬇️ Downloading video...");
-    const dl = await downloadToTempFile(videoUrl);
-    tmpDir = dl.tmpDir;
+    // 4) Get all Airtable video_url values
+    console.log("Fetching Airtable existing video_url values...");
+    const existingUrls = await getAllAirtableVideoUrls();
+    const existingSet = new Set(existingUrls);
+    console.log(`📌 Airtable has ${existingUrls.length} video_url entries`);
 
-    console.log("🖼️ Extracting frames...");
-    const framesBase64 = await extractFramesBase64(dl.videoPath, {
-      fps: 1,
-      maxFrames: 12,
-    });
-    console.log(`✅ Extracted ${framesBase64.length} frames`);
+    // 5) Diff (new URLs only)
+    const newUrls = allUrls.filter((u) => !existingSet.has(u));
+    console.log(`🆕 New URLs to tag: ${newUrls.length}`);
 
-    // 5) OpenAI analysis
-    console.log("🤖 Sending frames + prompt to OpenAI...");
-    const analysisText = await analyzeVideoWithOpenAI({
-      promptText,
-      framesBase64,
-      videoUrl,
-    });
-    console.log("✅ OPENAI RAW TEXT:", analysisText);
+    // Optional: limit per run to avoid timeouts/cost
+    const LIMIT = Number(process.env.BATCH_LIMIT || 10);
+    const toProcess = newUrls.slice(0, LIMIT);
 
-    // 6) ✅ Parse to JSON with the 7 keys
-    const tagsObj = safeJsonFromText(analysisText);
+    const results = [];
 
-    // 7) ✅ Create Airtable row
-    console.log("📌 Creating Airtable row...");
-    const airtableResp = await createAirtableRow({ videoUrl, tagsObj });
-    console.log("✅ Airtable saved:", airtableResp?.records?.[0]?.id);
+    // 6) Process ONE BY ONE (your exact existing pipeline)
+    for (const videoUrl of toProcess) {
+      console.log("====================================");
+      console.log("🌐 PROCESSING:", videoUrl);
+
+      try {
+        console.log("⬇️ Downloading video...");
+        const dl = await downloadToTempFile(videoUrl);
+        tmpDir = dl.tmpDir;
+
+        console.log("🖼️ Extracting frames...");
+        const framesBase64 = await extractFramesBase64(dl.videoPath, {
+          fps: 1,
+          maxFrames: 12,
+        });
+        console.log(`✅ Extracted ${framesBase64.length} frames`);
+
+        console.log("🤖 Sending frames + prompt to OpenAI...");
+        const analysisText = await analyzeVideoWithOpenAI({
+          promptText,
+          framesBase64,
+          videoUrl,
+        });
+        console.log("✅ OPENAI RAW TEXT:", analysisText);
+
+        const tagsObj = safeJsonFromText(analysisText);
+
+        console.log("📌 Creating Airtable row...");
+        const airtableResp = await createAirtableRow({ videoUrl, tagsObj });
+        console.log("✅ Airtable saved:", airtableResp?.records?.[0]?.id);
+
+        results.push({
+          videoUrl,
+          ok: true,
+          parsed: tagsObj,
+          airtableRecordId: airtableResp?.records?.[0]?.id || null,
+        });
+      } catch (err) {
+        console.error("❌ Failed processing:", videoUrl, err);
+        results.push({
+          videoUrl,
+          ok: false,
+          error: err.message,
+        });
+      } finally {
+        if (tmpDir) {
+          try {
+            await fs.rm(tmpDir, { recursive: true, force: true });
+          } catch {}
+          tmpDir = null;
+        }
+      }
+    }
 
     return res.json({
       ok: true,
-      latestFile: latestKey,
-      videoUrl,
-      notionPrompt: promptText,
-      openaiRaw: analysisText,
-      parsed: tagsObj,
-      airtable: airtableResp,
+      r2_total: allKeys.length,
+      airtable_existing: existingUrls.length,
+      new_found: newUrls.length,
+      processed_now: toProcess.length,
+      remaining_new: Math.max(0, newUrls.length - toProcess.length),
+      results,
     });
   } catch (e) {
     console.error("Webhook error:", e);
     return res.status(500).json({ ok: false, error: e.message });
-  } finally {
-    if (tmpDir) {
-      try {
-        await fs.rm(tmpDir, { recursive: true, force: true });
-      } catch {}
-    }
   }
 });
+
 
 // STEP 14) start server
 const port = process.env.PORT || 3000;
