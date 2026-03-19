@@ -134,7 +134,7 @@ async function downloadToTempFile(url) {
 }
 
 // STEP 8) helper: extract frames (base64 images) using ffmpeg (SMALLER + FEWER)
-async function extractFramesBase64(videoPath, { fps = 0.5, maxFrames = 4 } = {}) {
+async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 5 } = {}) {
   const framesDir = path.join(path.dirname(videoPath), "frames");
   await fs.mkdir(framesDir, { recursive: true });
 
