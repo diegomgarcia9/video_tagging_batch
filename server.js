@@ -370,8 +370,6 @@ app.post("/webhook", async (_req, res) => {
         // Help GC: drop big arrays ASAP
         framesBase64.length = 0;
 
-        console.log("✅ OPENAI RAW TEXT:", analysisText);
-
         const tagsObj = safeJsonFromText(analysisText);
 
         console.log("📌 Creating Airtable row...");
