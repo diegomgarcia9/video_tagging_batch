@@ -318,9 +318,7 @@ app.post("/webhook", async (_req, res) => {
   try {
     console.log("🔥 WEBHOOK CAPTURED (BATCH MODE)");
 
-    console.log("Retrieving Notion page Prompt...");
     const promptText = await getNotionPrompt();
-    console.log("🧠 NOTION PROMPT:", promptText);
 
     console.log("Listing ALL upload keys from R2...");
     const allKeys = await listAllUploadKeys();
