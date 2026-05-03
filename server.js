@@ -134,14 +134,14 @@ async function downloadToTempFile(url) {
 }
 
 // STEP 8) helper: extract frames (base64 images) using ffmpeg (SMALLER + FEWER)
-async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 5 } = {}) {
+async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
   const framesDir = path.join(path.dirname(videoPath), "frames");
   await fs.mkdir(framesDir, { recursive: true });
 
   await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       // scale down frames + lower JPEG quality = much smaller memory/payload
-      .outputOptions([`-vf fps=${fps},scale=512:-1`, "-q:v 8"])
+      .outputOptions([`-vf fps=${fps},scale=320:-1`, "-q:v 8"])
       .output(path.join(framesDir, "frame-%03d.jpg"))
       .on("end", resolve)
       .on("error", reject)
