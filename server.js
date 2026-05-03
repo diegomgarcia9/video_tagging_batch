@@ -341,7 +341,11 @@ app.post("/webhook", async (_req, res) => {
     console.log(`🆕 New URLs to tag: ${newUrls.length}`);
 
     const LIMIT = Number(process.env.BATCH_LIMIT || 10);
-    const toProcess = newUrls.slice(0, LIMIT);
+    // STEP: Randomize new videos before picking batch
+    const shuffledNewUrls = [...newUrls].sort(() => Math.random() - 0.5);
+    
+    // STEP: Pick only the batch limit
+    const toProcess = shuffledNewUrls.slice(0, LIMIT);
 
     const results = [];
 
