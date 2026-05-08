@@ -99,7 +99,7 @@ async function listAllUploadKeys(bucket, prefix = "") {
     const response = await r2.send(command);
 
     for (const f of response.Contents || []) {
-      if (f?.Key) keys.push(f.Key);
+      if (f?.Key && !f.Key.endsWith("/")) keys.push(f.Key);
     }
 
     if (!response.IsTruncated) break;
