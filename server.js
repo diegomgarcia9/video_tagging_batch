@@ -153,8 +153,15 @@ function buildSourceUrl(key) {
 // ── FFmpeg helpers ────────────────────────────────────────────────────────────
 
 async function downloadToTempFile(url) {
+  console.error(`[download] fetching: ${url}`);
   const res = await fetch(url);
+  const contentType = res.headers.get("content-type") || "unknown";
+  console.error(`[download] status=${res.status} content-type=${contentType}`);
   if (!res.ok) throw new Error(`Failed to download video (${res.status})`);
+  if (!contentType.includes("video") && !contentType.includes("octet-stream")) {
+    const preview = (await res.text()).slice(0, 200);
+    throw new Error(`Unexpected content-type "${contentType}". Body preview: ${preview}`);
+  }
   if (!res.body) throw new Error("No response body to stream");
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-"));
