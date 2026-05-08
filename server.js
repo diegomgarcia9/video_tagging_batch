@@ -169,14 +169,16 @@ async function processVideoForStorage(input, outputDir) {
   const thumbPath = path.join(outputDir, "thumb.jpg");
 
   // Center-crop to 9:16 then scale to 1080x1920.
-  // -threads 1 reduces decoder frame buffer count — critical for 4K sources which
-  // need ~200MB+ just for reference frame buffers at full parallelism.
-  // -preset ultrafast reduces encoder memory at the cost of slightly larger output.
+  // -cpuflags 0 disables all SIMD (AVX2/SSE) optimizations. ffmpeg-static has a
+  // known alignment SIGSEGV with 4096-wide frames because 4096 = 2^12 triggers
+  // edge cases in vectorized decode routines. Plain-C fallbacks are safe.
+  // format=yuv420p as first filter immediately converts 10-bit HDR frames to 8-bit,
+  // halving per-frame memory before any other operation runs.
   await new Promise((resolve, reject) => {
     ffmpeg(input)
-      .inputOptions(["-t 5"])
+      .inputOptions(["-cpuflags 0", "-t 5"])
       .outputOptions([
-        "-vf crop=ih*9/16:ih,scale=1080:1920,fps=30",
+        "-vf format=yuv420p,crop=ih*9/16:ih,scale=1080:1920,fps=30",
         "-c:v libx264",
         "-pix_fmt yuv420p",
         "-preset ultrafast",
