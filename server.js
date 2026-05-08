@@ -23,7 +23,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+import ffprobeStatic from "ffprobe-static";
+
 ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobeStatic.path);
 
 const {
   R2_ACCOUNT_ID,
@@ -205,6 +208,25 @@ async function processVideoForStorage(input, outputDir) {
   });
 
   return { clipPath, thumbPath };
+}
+
+// Probe a video (local path or URL) and return the first video stream's metadata.
+// Throws if ffprobe cannot read the file — caller should skip/log gracefully.
+async function probeVideo(input) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(input, (err, metadata) => {
+      if (err) return reject(err);
+      const videoStream = (metadata.streams || []).find((s) => s.codec_type === "video");
+      if (!videoStream) return reject(new Error("No video stream found"));
+      resolve({
+        codec: videoStream.codec_name,
+        pixFmt: videoStream.pix_fmt,
+        width: videoStream.width,
+        height: videoStream.height,
+        duration: metadata.format?.duration,
+      });
+    });
+  });
 }
 
 async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
@@ -551,6 +573,18 @@ app.post("/migrate", async (req, res) => {
       const newThumbUrl = buildDestUrl(newThumbKey);
 
       try {
+        // Probe before processing — identifies codec/format and surfaces files
+        // that ffprobe can't read at all (truly broken or unsupported format).
+        let probeInfo;
+        try {
+          probeInfo = await probeVideo(oldUrl);
+          console.log(`[migrate] ${filename} codec=${probeInfo.codec} pix_fmt=${probeInfo.pixFmt} size=${probeInfo.width}x${probeInfo.height}`);
+        } catch (probeErr) {
+          console.warn(`[migrate] ffprobe failed for ${filename}: ${probeErr.message} — skipping`);
+          results.push({ filename, ok: false, skipped: true, error: `ffprobe: ${probeErr.message}` });
+          continue;
+        }
+
         // FFmpeg reads directly from the source URL — no full download needed.
         // The -t 5 input option means only ~5s of data is ever pulled from the source.
         tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-"));
