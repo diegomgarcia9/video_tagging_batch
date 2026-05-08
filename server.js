@@ -154,7 +154,7 @@ let workerRunning = false;
 
 async function readQueueFromR2() {
   try {
-    const resp = await r2.send(new GetObjectCommand({ Bucket: QUEUE_BUCKET_NAME, Key: "queue.json" }));
+    const resp = await r2.send(new GetObjectCommand({ Bucket: QUEUE_BUCKET_NAME, Key: "video_jobs_queue/queue.json" }));
     const body = await resp.Body.transformToString();
     return JSON.parse(body);
   } catch (e) {
@@ -170,7 +170,7 @@ async function persistQueue() {
   if (!QUEUE_BUCKET_NAME) return;
   await r2.send(new PutObjectCommand({
     Bucket: QUEUE_BUCKET_NAME,
-    Key: "queue.json",
+    Key: "video_jobs_queue/queue.json",
     Body: JSON.stringify(jobQueue),
     ContentType: "application/json",
   }));
