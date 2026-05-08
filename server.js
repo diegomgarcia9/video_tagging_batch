@@ -178,7 +178,7 @@ async function processVideoForStorage(input, outputDir) {
   // format=yuv420p as first filter immediately converts 10-bit HDR frames to 8-bit,
   // halving per-frame memory before any other operation runs.
   await new Promise((resolve, reject) => {
-    ffmpeg(input)
+    const cmd = ffmpeg(input)
       .inputOptions(["-cpuflags 0", "-t 5"])
       .outputOptions([
         "-vf format=yuv420p,crop=if(gt(iw\\,ih)\\,ih*9/16\\,iw):if(gt(iw\\,ih)\\,ih\\,iw*16/9),scale=1080:1920,fps=30",
@@ -189,11 +189,13 @@ async function processVideoForStorage(input, outputDir) {
         "-an",
         "-movflags +faststart",
       ])
-      .output(clipPath)
-      .on("stderr", (line) => console.error(`[ffmpeg] ${line}`))
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
+      .output(clipPath);
+
+    cmd.on("start", (cmdLine) => console.log(`[ffmpeg cmd] ${cmdLine}`));
+    cmd.on("stderr", (line) => console.error(`[ffmpeg] ${line}`));
+    cmd.on("end", resolve);
+    cmd.on("error", reject);
+    cmd.run();
   });
 
   // Extract thumbnail from the already-processed clip (1080x1920, ~few MB) —
