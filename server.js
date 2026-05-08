@@ -1,28 +1,39 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs/promises";
-import { createWriteStream } from "fs";
+import { createReadStream, createWriteStream } from "fs";
 import { pipeline } from "stream/promises";
 import path from "path";
 import os from "os";
 
-import { S3Client, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  ListObjectsV2Command,
+  HeadObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
 import { Client as NotionClient } from "@notionhq/client";
 import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
+import multer from "multer";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+ffmpeg.setFfmpegPath(ffmpegPath);
+
 const {
   R2_ACCOUNT_ID,
   R2_ACCESS_KEY_ID,
   R2_SECRET_ACCESS_KEY,
-  R2_BUCKET_NAME,
-  R2_PUBLIC_BASE_URL,
+  R2_BUCKET_NAME,       // destination bucket: video-jobs-data
+  R2_PUBLIC_BASE_URL,   // public URL for video-jobs-data
+
+  SOURCE_BUCKET,        // migration source: content-machine
+  SOURCE_PUBLIC_URL,    // public URL for content-machine
 
   NOTION_API_KEY,
   NOTION_PAGE_ID,
@@ -47,23 +58,47 @@ const r2 = new S3Client({
 const notion = new NotionClient({ auth: NOTION_API_KEY });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, file, cb) => cb(null, `upload_${Date.now()}_${file.originalname}`),
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 },
+});
 
-async function listAllUploadKeys() {
+// ── Tag fields used to determine completeness ────────────────────────────────
+const TAG_FIELDS = [
+  "emotional_tone",
+  "energy_level",
+  "visual_style",
+  "context",
+  "human_presence",
+  "lighting",
+  "color_mood",
+  "background",
+  "pace",
+  "narrative_function",
+  "visual_medium",
+  "short_description",
+];
+
+// ── R2 helpers ───────────────────────────────────────────────────────────────
+
+async function listAllUploadKeys(bucket, prefix = "") {
   const keys = [];
-  let ContinuationToken = undefined;
+  let ContinuationToken;
 
   while (true) {
     const command = new ListObjectsV2Command({
-      Bucket: R2_BUCKET_NAME,
+      Bucket: bucket,
+      Prefix: prefix,
       MaxKeys: 1000,
       ContinuationToken,
     });
 
     const response = await r2.send(command);
-    const files = response.Contents || [];
 
-    for (const f of files) {
+    for (const f of response.Contents || []) {
       if (f?.Key) keys.push(f.Key);
     }
 
@@ -74,51 +109,82 @@ async function listAllUploadKeys() {
   return keys;
 }
 
-async function getNotionPrompt() {
-  if (!NOTION_API_KEY) throw new Error("Missing env var: NOTION_API_KEY");
-  if (!NOTION_PAGE_ID) throw new Error("Missing env var: NOTION_PAGE_ID");
-
-  const page = await notion.pages.retrieve({ page_id: NOTION_PAGE_ID });
-  const prop = page?.properties?.Prompt;
-
-  const textParts =
-    prop?.type === "title"
-      ? prop.title
-      : prop?.type === "rich_text"
-      ? prop.rich_text
-      : null;
-
-  if (!textParts) {
-    return `[Prompt property is type "${prop?.type ?? "unknown"}" — not title/rich_text]`;
+async function doesKeyExist(bucket, key) {
+  try {
+    await r2.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return true;
+  } catch {
+    return false;
   }
-
-  return textParts.map((t) => t.plain_text).join("").trim() || "[Prompt is empty]";
 }
 
-function buildPublicVideoUrl(key) {
-  if (!R2_PUBLIC_BASE_URL) throw new Error("Missing env var: R2_PUBLIC_BASE_URL");
+async function uploadBufferToR2(bucket, key, buffer, contentType) {
+  await r2.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType,
+    })
+  );
+}
 
-  const base = R2_PUBLIC_BASE_URL.replace(/\/+$/, "");
+function buildPublicUrl(baseUrl, key) {
+  const base = baseUrl.replace(/\/+$/, "");
   const safeKey = key
     .split("/")
     .map((seg) => encodeURIComponent(seg))
     .join("/");
-
   return `${base}/${safeKey}`;
 }
 
+function buildDestUrl(key) {
+  return buildPublicUrl(R2_PUBLIC_BASE_URL, key);
+}
+
+function buildSourceUrl(key) {
+  return buildPublicUrl(SOURCE_PUBLIC_URL, key);
+}
+
+// ── FFmpeg helpers ────────────────────────────────────────────────────────────
+
 async function downloadToTempFile(url) {
   const res = await fetch(url);
-
   if (!res.ok) throw new Error(`Failed to download video (${res.status})`);
   if (!res.body) throw new Error("No response body to stream");
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "video-"));
   const videoPath = path.join(tmpDir, "input.mp4");
-
   await pipeline(res.body, createWriteStream(videoPath));
 
   return { tmpDir, videoPath };
+}
+
+// Standardize to 30fps, trim to 5 seconds, and extract thumbnail at frame 50 (≈1.667s)
+async function processVideoForStorage(inputPath, outputDir) {
+  const clipPath = path.join(outputDir, "clip.mp4");
+  const thumbPath = path.join(outputDir, "thumb.jpg");
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions(["-r 30", "-t 5", "-c:v libx264", "-c:a aac", "-movflags +faststart"])
+      .output(clipPath)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+
+  // frame 50 at 30fps = 1.6667s
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions(["-ss 1.667", "-frames:v 1", "-q:v 2"])
+      .output(thumbPath)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+
+  return { clipPath, thumbPath };
 }
 
 async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
@@ -140,19 +206,34 @@ async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
     .slice(0, maxFrames);
 
   const images = [];
-
   for (const f of files) {
-    const p = path.join(framesDir, f);
-    const b = await fs.readFile(p);
+    const b = await fs.readFile(path.join(framesDir, f));
     images.push(b.toString("base64"));
   }
 
   return images;
 }
 
-async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
-  if (!OPENAI_API_KEY) throw new Error("Missing env var: OPENAI_API_KEY");
+// ── OpenAI ────────────────────────────────────────────────────────────────────
 
+async function getNotionPrompt() {
+  if (!NOTION_API_KEY) throw new Error("Missing env var: NOTION_API_KEY");
+  if (!NOTION_PAGE_ID) throw new Error("Missing env var: NOTION_PAGE_ID");
+
+  const page = await notion.pages.retrieve({ page_id: NOTION_PAGE_ID });
+  const prop = page?.properties?.Prompt;
+  const textParts =
+    prop?.type === "title"
+      ? prop.title
+      : prop?.type === "rich_text"
+      ? prop.rich_text
+      : null;
+
+  if (!textParts) return `[Prompt property type "${prop?.type ?? "unknown"}" not supported]`;
+  return textParts.map((t) => t.plain_text).join("").trim() || "[Prompt is empty]";
+}
+
+async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
   const model = OPENAI_VISION_MODEL || "gpt-4.1-mini";
 
   const content = [
@@ -192,18 +273,14 @@ async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
 function safeJsonFromText(text) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
-
   if (start === -1 || end === -1 || end <= start) {
     throw new Error("OpenAI output did not contain a JSON object");
   }
-
-  const jsonBlock = text.slice(start, end + 1);
-
-  const cleaned = jsonBlock
+  const cleaned = text
+    .slice(start, end + 1)
     .split("\n")
     .filter((line) => line.trim() !== "Menu")
     .join("\n");
-
   return JSON.parse(cleaned);
 }
 
@@ -213,259 +290,188 @@ function toText(val) {
   return String(val).trim();
 }
 
-async function createAirtableRow({ videoUrl }) {
-  if (!AIRTABLE_API_KEY) throw new Error("Missing env var: AIRTABLE_API_KEY");
-  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
-  if (!AIRTABLE_TABLE_NAME) throw new Error("Missing env var: AIRTABLE_TABLE_NAME");
+// ── Airtable helpers ──────────────────────────────────────────────────────────
 
-  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-    AIRTABLE_TABLE_NAME
-  )}`;
+function airtableUrl(path = "") {
+  return `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_NAME)}${path}`;
+}
 
+function airtableHeaders() {
+  return {
+    Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+}
+
+async function createAirtableRow({ videoUrl, thumbnailUrl = "", status = "processing" }) {
   const body = {
     records: [
       {
         fields: {
           video_url: toText(videoUrl),
-          status: "processing",
+          ...(thumbnailUrl ? { thumbnail_url: toText(thumbnailUrl) } : {}),
+          status,
         },
       },
     ],
   };
 
-  const resp = await fetch(url, {
+  const resp = await fetch(airtableUrl(), {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: airtableHeaders(),
     body: JSON.stringify(body),
   });
 
   const data = await resp.json();
-
-  if (!resp.ok) {
-    throw new Error(`Airtable create error: ${resp.status} ${JSON.stringify(data)}`);
-  }
-
+  if (!resp.ok) throw new Error(`Airtable create error: ${resp.status} ${JSON.stringify(data)}`);
   return data?.records?.[0];
 }
 
 async function updateAirtableRow({ recordId, fields }) {
-  if (!AIRTABLE_API_KEY) throw new Error("Missing env var: AIRTABLE_API_KEY");
-  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
-  if (!AIRTABLE_TABLE_NAME) throw new Error("Missing env var: AIRTABLE_TABLE_NAME");
-
-  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-    AIRTABLE_TABLE_NAME
-  )}`;
-
-  const body = {
-    records: [
-      {
-        id: recordId,
-        fields,
-      },
-    ],
-  };
-
-  const resp = await fetch(url, {
+  const body = { records: [{ id: recordId, fields }] };
+  const resp = await fetch(airtableUrl(), {
     method: "PATCH",
-    headers: {
-      Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: airtableHeaders(),
     body: JSON.stringify(body),
   });
 
   const data = await resp.json();
-
-  if (!resp.ok) {
-    throw new Error(`Airtable update error: ${resp.status} ${JSON.stringify(data)}`);
-  }
-
+  if (!resp.ok) throw new Error(`Airtable update error: ${resp.status} ${JSON.stringify(data)}`);
   return data?.records?.[0];
 }
 
-async function getAllAirtableVideoUrls() {
-  if (!AIRTABLE_API_KEY) throw new Error("Missing env var: AIRTABLE_API_KEY");
-  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
-  if (!AIRTABLE_TABLE_NAME) throw new Error("Missing env var: AIRTABLE_TABLE_NAME");
+async function getAirtableRecord(recordId) {
+  const resp = await fetch(airtableUrl(`/${recordId}`), {
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(`Airtable get error: ${resp.status} ${JSON.stringify(data)}`);
+  return data;
+}
 
-  const baseUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-    AIRTABLE_TABLE_NAME
-  )}`;
-
-  const urls = [];
-  let offset = undefined;
+// Returns all records as array of { id, fields }
+async function getAllAirtableRecords(fieldsToFetch = []) {
+  const records = [];
+  let offset;
 
   while (true) {
-    const url = new URL(baseUrl);
-
-    url.searchParams.append("fields[]", "video_url");
+    const url = new URL(airtableUrl());
     url.searchParams.set("pageSize", "100");
-
+    for (const f of fieldsToFetch) url.searchParams.append("fields[]", f);
     if (offset) url.searchParams.set("offset", offset);
 
     const resp = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
     });
-
     const data = await resp.json();
-
-    if (!resp.ok) {
-      throw new Error(`Airtable read error: ${resp.status} ${JSON.stringify(data)}`);
-    }
+    if (!resp.ok) throw new Error(`Airtable list error: ${resp.status} ${JSON.stringify(data)}`);
 
     for (const rec of data.records || []) {
-      const v = rec?.fields?.video_url;
-      if (v) urls.push(String(v).trim());
+      records.push({ id: rec.id, fields: rec.fields });
     }
 
     if (!data.offset) break;
     offset = data.offset;
   }
 
-  return urls;
+  return records;
 }
 
-app.get("/", (_req, res) => {
-  console.log("Health check hit");
-  res.send("tagging service ok");
-});
+async function getAllAirtableVideoUrls() {
+  const records = await getAllAirtableRecords(["video_url"]);
+  return records
+    .map((r) => String(r.fields.video_url || "").trim())
+    .filter(Boolean);
+}
 
+// ── Status determination ──────────────────────────────────────────────────────
+
+function computeStatus(fields) {
+  const current = String(fields.status || "").toLowerCase();
+  // Don't overwrite these states — they're set by active processes
+  if (current === "processing") return null;
+
+  const filledTags = TAG_FIELDS.filter((f) => {
+    const val = fields[f];
+    return val && String(val).trim().length > 0;
+  });
+
+  if (filledTags.length === TAG_FIELDS.length) return "tagged";
+  if (filledTags.length > 0) return "incomplete";
+  if (fields.video_url) return "uploaded";
+  return null;
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+app.get("/", (_req, res) => res.send("tagging service ok"));
+
+// POST /webhook — tag untagged clips from video-jobs-data/clips/
 app.post("/webhook", async (_req, res) => {
   let tmpDir = null;
 
   try {
-    console.log("🔥 WEBHOOK CAPTURED (BATCH MODE)");
-
     const promptText = await getNotionPrompt();
 
-    console.log("Listing ALL upload keys from R2...");
-    const allKeys = await listAllUploadKeys();
-
+    const allKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
     if (!allKeys.length) {
-      console.log("⚠️ No files found in bucket");
-      return res.status(404).json({
-        ok: false,
-        error: "Bucket empty",
-      });
+      return res.status(404).json({ ok: false, error: "No clips found in bucket" });
     }
 
-    console.log(`📦 Found ${allKeys.length} objects in R2`);
-
-    const allUrls = allKeys.map(buildPublicVideoUrl);
-
-    console.log("Fetching Airtable existing video_url values...");
+    const allUrls = allKeys.map((k) => buildDestUrl(k));
     const existingUrls = await getAllAirtableVideoUrls();
     const existingSet = new Set(existingUrls);
-
-    console.log(`📌 Airtable has ${existingUrls.length} video_url entries`);
-
     const newUrls = allUrls.filter((u) => !existingSet.has(u));
 
-    console.log(`🆕 New URLs to tag: ${newUrls.length}`);
-
     const LIMIT = Number(process.env.BATCH_LIMIT || 10);
-
-    const shuffledNewUrls = [...newUrls].sort(() => Math.random() - 0.5);
-    const toProcess = shuffledNewUrls.slice(0, LIMIT);
-
+    const toProcess = [...newUrls].sort(() => Math.random() - 0.5).slice(0, LIMIT);
     const results = [];
 
     for (const videoUrl of toProcess) {
       let airtableRecord = null;
 
-      console.log("====================================");
-      console.log("🌐 PROCESSING:", videoUrl);
-
       try {
-        console.log("📌 Creating Airtable row with video URL...");
-        airtableRecord = await createAirtableRow({ videoUrl });
+        // Derive thumbnail URL from clip key
+        const clipKey = toProcess.indexOf(videoUrl) >= 0
+          ? allKeys[allUrls.indexOf(videoUrl)]
+          : null;
+        const basename = clipKey ? path.basename(clipKey, path.extname(clipKey)) : null;
+        const thumbnailUrl = basename ? buildDestUrl(`thumbnails/${basename}.jpg`) : "";
 
+        airtableRecord = await createAirtableRow({ videoUrl, thumbnailUrl, status: "processing" });
         const recordId = airtableRecord.id;
 
-        console.log("✅ Airtable row created:", recordId);
-
-        console.log("⬇️ Downloading video...");
         const dl = await downloadToTempFile(videoUrl);
         tmpDir = dl.tmpDir;
 
-        console.log("🖼️ Extracting frames...");
         const framesBase64 = await extractFramesBase64(dl.videoPath);
-
-        console.log(`✅ Extracted ${framesBase64.length} frames`);
-
-        console.log("🤖 Sending frames + prompt to OpenAI...");
-        const analysisText = await analyzeVideoWithOpenAI({
-          promptText,
-          framesBase64,
-          videoUrl,
-        });
-
+        const analysisText = await analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl });
         framesBase64.length = 0;
 
         const tagsObj = safeJsonFromText(analysisText);
-
-        const updateFields = {
-          status: "tagged",
-        };
-
+        const updateFields = { status: "tagged" };
         for (const [key, value] of Object.entries(tagsObj || {})) {
           const text = toText(value);
-          if (!text) continue;
-          updateFields[key] = text;
+          if (text) updateFields[key] = text;
         }
 
-        console.log("📌 Updating Airtable row with tags...");
-        await updateAirtableRow({
-          recordId,
-          fields: updateFields,
-        });
+        await updateAirtableRow({ recordId, fields: updateFields });
 
-        console.log("✅ Airtable updated:", recordId);
-
-        results.push({
-          videoUrl,
-          ok: true,
-          parsed: tagsObj,
-          airtableRecordId: recordId,
-        });
+        results.push({ videoUrl, ok: true, parsed: tagsObj, airtableRecordId: recordId });
       } catch (err) {
-        console.error("❌ Failed processing:", videoUrl, err);
-
+        console.error("Failed processing:", videoUrl, err);
         if (airtableRecord?.id) {
           try {
             await updateAirtableRow({
               recordId: airtableRecord.id,
-              fields: {
-                status: "failed",
-                error_message: String(err.message || err).slice(0, 1000),
-              },
-            });
-          } catch (airtableErr) {
-            console.error("❌ Failed updating Airtable error status:", airtableErr);
-          }
-        }
-
-        results.push({
-          videoUrl,
-          ok: false,
-          airtableRecordId: airtableRecord?.id || null,
-          error: err.message,
-        });
-      } finally {
-        if (tmpDir) {
-          try {
-            await fs.rm(tmpDir, {
-              recursive: true,
-              force: true,
+              fields: { status: "failed", error_message: String(err.message).slice(0, 1000) },
             });
           } catch {}
-
+        }
+        results.push({ videoUrl, ok: false, airtableRecordId: airtableRecord?.id || null, error: err.message });
+      } finally {
+        if (tmpDir) {
+          try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
           tmpDir = null;
         }
       }
@@ -482,16 +488,259 @@ app.post("/webhook", async (_req, res) => {
     });
   } catch (e) {
     console.error("Webhook error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-    return res.status(500).json({
-      ok: false,
-      error: e.message,
+// POST /migrate — process clips from content-machine into video-jobs-data/clips/
+app.post("/migrate", async (req, res) => {
+  let tmpDir = null;
+
+  try {
+    if (!SOURCE_BUCKET) return res.status(400).json({ ok: false, error: "SOURCE_BUCKET env var not set" });
+    if (!SOURCE_PUBLIC_URL) return res.status(400).json({ ok: false, error: "SOURCE_PUBLIC_URL env var not set" });
+
+    const LIMIT = Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 20);
+
+    // List source and destination
+    const sourceKeys = await listAllUploadKeys(SOURCE_BUCKET);
+    const destClipKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
+    const processedFilenames = new Set(destClipKeys.map((k) => path.basename(k)));
+
+    const unprocessed = sourceKeys.filter((k) => !processedFilenames.has(path.basename(k)));
+    const toProcess = unprocessed.slice(0, LIMIT);
+
+    // Load all Airtable records indexed by video_url
+    const allRecords = await getAllAirtableRecords(["video_url", "thumbnail_url"]);
+    const recordByUrl = new Map();
+    for (const rec of allRecords) {
+      if (rec.fields.video_url) recordByUrl.set(String(rec.fields.video_url).trim(), rec.id);
+    }
+
+    const results = [];
+
+    for (const sourceKey of toProcess) {
+      tmpDir = null;
+      const filename = path.basename(sourceKey);
+      const basename = path.basename(sourceKey, path.extname(sourceKey));
+
+      const oldUrl = buildSourceUrl(sourceKey);
+      const newClipKey = `clips/${filename}`;
+      const newThumbKey = `thumbnails/${basename}.jpg`;
+      const newClipUrl = buildDestUrl(newClipKey);
+      const newThumbUrl = buildDestUrl(newThumbKey);
+
+      try {
+        // Download source clip
+        const dl = await downloadToTempFile(oldUrl);
+        tmpDir = dl.tmpDir;
+
+        // Process: 30fps, 5s trim, thumbnail at frame 50
+        const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
+
+        // Upload clip and thumbnail to destination
+        const clipBuffer = await fs.readFile(clipPath);
+        const thumbBuffer = await fs.readFile(thumbPath);
+
+        await uploadBufferToR2(R2_BUCKET_NAME, newClipKey, clipBuffer, "video/mp4");
+        await uploadBufferToR2(R2_BUCKET_NAME, newThumbKey, thumbBuffer, "image/jpeg");
+
+        // Find existing Airtable record by old URL, new URL, or create
+        const existingByOld = recordByUrl.get(oldUrl);
+        const existingByNew = recordByUrl.get(newClipUrl);
+
+        if (existingByOld) {
+          await updateAirtableRow({
+            recordId: existingByOld,
+            fields: { video_url: newClipUrl, thumbnail_url: newThumbUrl },
+          });
+          recordByUrl.delete(oldUrl);
+          recordByUrl.set(newClipUrl, existingByOld);
+          results.push({ filename, ok: true, action: "updated", airtableRecordId: existingByOld });
+        } else if (existingByNew) {
+          await updateAirtableRow({
+            recordId: existingByNew,
+            fields: { thumbnail_url: newThumbUrl },
+          });
+          results.push({ filename, ok: true, action: "thumbnail_updated", airtableRecordId: existingByNew });
+        } else {
+          const rec = await createAirtableRow({
+            videoUrl: newClipUrl,
+            thumbnailUrl: newThumbUrl,
+            status: "uploaded",
+          });
+          recordByUrl.set(newClipUrl, rec.id);
+          results.push({ filename, ok: true, action: "created", airtableRecordId: rec.id });
+        }
+      } catch (err) {
+        console.error("Migration failed for:", sourceKey, err);
+        results.push({ filename, ok: false, error: err.message });
+      } finally {
+        if (tmpDir) {
+          try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
+          tmpDir = null;
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      source_total: sourceKeys.length,
+      already_processed: sourceKeys.length - unprocessed.length,
+      new_found: unprocessed.length,
+      processed_now: toProcess.length,
+      remaining: Math.max(0, unprocessed.length - toProcess.length),
+      results,
     });
+  } catch (e) {
+    console.error("Migration error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /sync-statuses — recalculate status for all records based on tag field completeness
+app.post("/sync-statuses", async (_req, res) => {
+  try {
+    const allRecords = await getAllAirtableRecords(["video_url", "status", ...TAG_FIELDS]);
+
+    let updated = 0;
+    let skipped = 0;
+
+    // Batch updates (Airtable allows up to 10 per PATCH)
+    const batchSize = 10;
+    const updates = [];
+
+    for (const rec of allRecords) {
+      const newStatus = computeStatus(rec.fields);
+      if (newStatus === null || newStatus === rec.fields.status) {
+        skipped++;
+        continue;
+      }
+      updates.push({ id: rec.id, fields: { status: newStatus } });
+    }
+
+    for (let i = 0; i < updates.length; i += batchSize) {
+      const batch = updates.slice(i, i + batchSize);
+      const body = { records: batch };
+      const resp = await fetch(airtableUrl(), {
+        method: "PATCH",
+        headers: airtableHeaders(),
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(`Airtable batch update error: ${resp.status} ${JSON.stringify(data)}`);
+      updated += batch.length;
+    }
+
+    return res.json({ ok: true, total: allRecords.length, updated, skipped });
+  } catch (e) {
+    console.error("Sync statuses error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /retag/:recordId — re-run AI tagging on a specific clip
+app.post("/retag/:recordId", async (req, res) => {
+  let tmpDir = null;
+
+  try {
+    const { recordId } = req.params;
+    const rec = await getAirtableRecord(recordId);
+    const videoUrl = rec?.fields?.video_url;
+    if (!videoUrl) return res.status(400).json({ ok: false, error: "Record has no video_url" });
+
+    const promptText = await getNotionPrompt();
+
+    await updateAirtableRow({ recordId, fields: { status: "processing" } });
+
+    const dl = await downloadToTempFile(videoUrl);
+    tmpDir = dl.tmpDir;
+
+    const framesBase64 = await extractFramesBase64(dl.videoPath);
+    const analysisText = await analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl });
+    framesBase64.length = 0;
+
+    const tagsObj = safeJsonFromText(analysisText);
+    const updateFields = { status: "tagged" };
+    for (const [key, value] of Object.entries(tagsObj || {})) {
+      const text = toText(value);
+      if (text) updateFields[key] = text;
+    }
+
+    await updateAirtableRow({ recordId, fields: updateFields });
+
+    return res.json({ ok: true, airtableRecordId: recordId, parsed: tagsObj });
+  } catch (e) {
+    console.error("Retag error:", e);
+    if (req.params.recordId) {
+      try {
+        await updateAirtableRow({
+          recordId: req.params.recordId,
+          fields: { status: "failed", error_message: String(e.message).slice(0, 1000) },
+        });
+      } catch {}
+    }
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    if (tmpDir) {
+      try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+});
+
+// POST /upload — accept a video file, process it, upload to R2, create Airtable record
+app.post("/upload", upload.single("clip"), async (req, res) => {
+  let tmpDir = null;
+  const uploadedPath = req.file?.path;
+
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded (field name: clip)" });
+
+    const originalName = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const basename = path.basename(originalName, path.extname(originalName));
+    const timestamp = Date.now();
+    const clipFilename = `${basename}_${timestamp}.mp4`;
+    const thumbFilename = `${basename}_${timestamp}.jpg`;
+
+    const newClipKey = `clips/${clipFilename}`;
+    const newThumbKey = `thumbnails/${thumbFilename}`;
+
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "upload-"));
+    const { clipPath, thumbPath } = await processVideoForStorage(uploadedPath, tmpDir);
+
+    const clipBuffer = await fs.readFile(clipPath);
+    const thumbBuffer = await fs.readFile(thumbPath);
+
+    await uploadBufferToR2(R2_BUCKET_NAME, newClipKey, clipBuffer, "video/mp4");
+    await uploadBufferToR2(R2_BUCKET_NAME, newThumbKey, thumbBuffer, "image/jpeg");
+
+    const newClipUrl = buildDestUrl(newClipKey);
+    const newThumbUrl = buildDestUrl(newThumbKey);
+
+    const rec = await createAirtableRow({
+      videoUrl: newClipUrl,
+      thumbnailUrl: newThumbUrl,
+      status: "uploaded",
+    });
+
+    return res.json({
+      ok: true,
+      airtableRecordId: rec.id,
+      video_url: newClipUrl,
+      thumbnail_url: newThumbUrl,
+    });
+  } catch (e) {
+    console.error("Upload error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    if (uploadedPath) {
+      try { await fs.unlink(uploadedPath); } catch {}
+    }
+    if (tmpDir) {
+      try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
+    }
   }
 });
 
 const port = process.env.PORT || 3000;
-
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+app.listen(port, () => console.log(`Tagging service listening on port ${port}`));
