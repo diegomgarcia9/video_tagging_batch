@@ -373,11 +373,12 @@ function airtableHeaders() {
   };
 }
 
-async function createAirtableRow({ videoUrl, thumbnailUrl = "", status = "processing" }) {
+async function createAirtableRow({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "processing" }) {
   const body = {
     records: [
       {
         fields: {
+          ...(sourceUrl ? { source_url: toText(sourceUrl) } : {}),
           video_url: toText(videoUrl),
           ...(thumbnailUrl ? { thumbnail_url: toText(thumbnailUrl) } : {}),
           status,
@@ -580,11 +581,14 @@ app.post("/migrate", async (req, res) => {
     const unprocessed = sourceKeys.filter((k) => !processedFilenames.has(path.basename(k)));
     const toProcess = unprocessed.slice(0, LIMIT);
 
-    // Load all Airtable records indexed by video_url
-    const allRecords = await getAllAirtableRecords(["video_url", "thumbnail_url"]);
-    const recordByUrl = new Map();
+    // Index records by source_url (to find existing records for this source clip)
+    // and by video_url (to detect already-processed clips from a previous run)
+    const allRecords = await getAllAirtableRecords(["source_url", "video_url", "thumbnail_url"]);
+    const recordBySourceUrl = new Map();
+    const recordByVideoUrl = new Map();
     for (const rec of allRecords) {
-      if (rec.fields.video_url) recordByUrl.set(String(rec.fields.video_url).trim(), rec.id);
+      if (rec.fields.source_url) recordBySourceUrl.set(String(rec.fields.source_url).trim(), rec.id);
+      if (rec.fields.video_url) recordByVideoUrl.set(String(rec.fields.video_url).trim(), rec.id);
     }
 
     const results = [];
@@ -610,31 +614,34 @@ app.post("/migrate", async (req, res) => {
         await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
         await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
 
-        // Find existing Airtable record by old URL, new URL, or create
-        const existingByOld = recordByUrl.get(oldUrl);
-        const existingByNew = recordByUrl.get(newClipUrl);
+        // Match by source_url first (normal case), then video_url (already processed), else create
+        const existingBySource = recordBySourceUrl.get(oldUrl);
+        const existingByVideo = recordByVideoUrl.get(newClipUrl);
 
-        if (existingByOld) {
+        if (existingBySource) {
           await updateAirtableRow({
-            recordId: existingByOld,
+            recordId: existingBySource,
             fields: { video_url: newClipUrl, thumbnail_url: newThumbUrl },
           });
-          recordByUrl.delete(oldUrl);
-          recordByUrl.set(newClipUrl, existingByOld);
-          results.push({ filename, ok: true, action: "updated", airtableRecordId: existingByOld });
-        } else if (existingByNew) {
+          recordByVideoUrl.set(newClipUrl, existingBySource);
+          results.push({ filename, ok: true, action: "updated", airtableRecordId: existingBySource });
+        } else if (existingByVideo) {
+          // Clip was already processed in a prior run — backfill source_url and refresh thumbnail
           await updateAirtableRow({
-            recordId: existingByNew,
-            fields: { thumbnail_url: newThumbUrl },
+            recordId: existingByVideo,
+            fields: { source_url: oldUrl, thumbnail_url: newThumbUrl },
           });
-          results.push({ filename, ok: true, action: "thumbnail_updated", airtableRecordId: existingByNew });
+          recordBySourceUrl.set(oldUrl, existingByVideo);
+          results.push({ filename, ok: true, action: "source_linked", airtableRecordId: existingByVideo });
         } else {
           const rec = await createAirtableRow({
+            sourceUrl: oldUrl,
             videoUrl: newClipUrl,
             thumbnailUrl: newThumbUrl,
             status: "uploaded",
           });
-          recordByUrl.set(newClipUrl, rec.id);
+          recordBySourceUrl.set(oldUrl, rec.id);
+          recordByVideoUrl.set(newClipUrl, rec.id);
           results.push({ filename, ok: true, action: "created", airtableRecordId: rec.id });
         }
       } catch (err) {
