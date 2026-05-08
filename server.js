@@ -190,6 +190,7 @@ async function processVideoForStorage(input, outputDir) {
         "-movflags +faststart",
       ])
       .output(clipPath)
+      .on("stderr", (line) => console.error(`[ffmpeg] ${line}`))
       .on("end", resolve)
       .on("error", reject)
       .run();
