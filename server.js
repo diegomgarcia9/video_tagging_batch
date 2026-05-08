@@ -161,24 +161,29 @@ async function downloadToTempFile(url) {
   return { tmpDir, videoPath };
 }
 
-// Standardize to 30fps, trim to 5 seconds, and extract thumbnail at frame 50 (≈1.667s)
-async function processVideoForStorage(inputPath, outputDir) {
+// Standardize to 30fps, trim to 5 seconds, extract thumbnail at frame 50 (≈1.667s).
+// `input` can be a local file path or a public URL — FFmpeg reads directly from URLs,
+// so for remote files we never download more than 5 seconds of data.
+async function processVideoForStorage(input, outputDir) {
   const clipPath = path.join(outputDir, "clip.mp4");
   const thumbPath = path.join(outputDir, "thumb.jpg");
 
+  // -t 5 as an input option stops FFmpeg reading the source after 5 seconds
   await new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .outputOptions(["-r 30", "-t 5", "-c:v libx264", "-c:a aac", "-movflags +faststart"])
+    ffmpeg(input)
+      .inputOptions(["-t 5"])
+      .outputOptions(["-r 30", "-c:v libx264", "-c:a aac", "-movflags +faststart"])
       .output(clipPath)
       .on("end", resolve)
       .on("error", reject)
       .run();
   });
 
-  // frame 50 at 30fps = 1.6667s
+  // Seek directly to frame 50 position in the source (fast seek, no full decode)
   await new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .outputOptions(["-ss 1.667", "-frames:v 1", "-q:v 2"])
+    ffmpeg(input)
+      .inputOptions(["-ss 1.667", "-t 1"])
+      .outputOptions(["-frames:v 1", "-q:v 2"])
       .output(thumbPath)
       .on("end", resolve)
       .on("error", reject)
@@ -532,15 +537,10 @@ app.post("/migrate", async (req, res) => {
       const newThumbUrl = buildDestUrl(newThumbKey);
 
       try {
-        // Download source clip
-        const dl = await downloadToTempFile(oldUrl);
-        tmpDir = dl.tmpDir;
-
-        // Process: 30fps, 5s trim, thumbnail at frame 50
-        const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
-
-        // Free the large source file from disk before uploading
-        try { await fs.unlink(dl.videoPath); } catch {}
+        // FFmpeg reads directly from the source URL — no full download needed.
+        // The -t 5 input option means only ~5s of data is ever pulled from the source.
+        tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-"));
+        const { clipPath, thumbPath } = await processVideoForStorage(oldUrl, tmpDir);
 
         await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
         await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
