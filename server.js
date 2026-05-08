@@ -191,10 +191,14 @@ async function processVideoForStorage(input, outputDir) {
       ])
       .output(clipPath);
 
-    cmd.on("start", (cmdLine) => console.log(`[ffmpeg cmd] ${cmdLine}`));
+    cmd.on("start", (cmdLine) => console.error(`[ffmpeg cmd] ${cmdLine}`));
     cmd.on("stderr", (line) => console.error(`[ffmpeg] ${line}`));
     cmd.on("end", resolve);
-    cmd.on("error", reject);
+    cmd.on("error", (err, _stdout, stderr) => {
+      console.error(`[ffmpeg error] ${err.message}`);
+      console.error(`[ffmpeg stderr dump] ${stderr}`);
+      reject(err);
+    });
     cmd.run();
   });
 
@@ -581,6 +585,8 @@ app.post("/migrate", async (req, res) => {
       try {
         const dl = await downloadToTempFile(oldUrl);
         tmpDir = dl.tmpDir;
+        const stat = await fs.stat(dl.videoPath);
+        console.error(`[migrate] downloaded ${filename}: ${stat.size} bytes at ${dl.videoPath}`);
         const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
 
         await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
