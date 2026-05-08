@@ -11,6 +11,7 @@ import {
   ListObjectsV2Command,
   HeadObjectCommand,
   PutObjectCommand,
+  GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { Client as NotionClient } from "@notionhq/client";
 import OpenAI from "openai";
@@ -48,6 +49,8 @@ const {
 
   SOURCE_BUCKET,        // migration source: content-machine
   SOURCE_PUBLIC_URL,    // public URL for content-machine
+
+  QUEUE_BUCKET_NAME,    // bucket for job queue persistence (video-jobs-queue)
 
   NOTION_API_KEY,
   NOTION_PAGE_ID,
@@ -142,6 +145,170 @@ async function uploadFileToR2(bucket, key, filePath, contentType) {
       ContentType: contentType,
     })
   );
+}
+
+// ── Job queue ─────────────────────────────────────────────────────────────────
+
+let jobQueue = [];
+let workerRunning = false;
+
+async function readQueueFromR2() {
+  try {
+    const resp = await r2.send(new GetObjectCommand({ Bucket: QUEUE_BUCKET_NAME, Key: "queue.json" }));
+    const body = await resp.Body.transformToString();
+    return JSON.parse(body);
+  } catch (e) {
+    if (e.name === "NoSuchKey" || e.$metadata?.httpStatusCode === 404) return [];
+    throw e;
+  }
+}
+
+async function persistQueue() {
+  const active = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
+  const finished = jobQueue.filter((j) => !["queued", "running"].includes(j.status)).slice(-20);
+  jobQueue = [...active, ...finished];
+  if (!QUEUE_BUCKET_NAME) return;
+  await r2.send(new PutObjectCommand({
+    Bucket: QUEUE_BUCKET_NAME,
+    Key: "queue.json",
+    Body: JSON.stringify(jobQueue),
+    ContentType: "application/json",
+  }));
+}
+
+async function initQueue() {
+  if (!QUEUE_BUCKET_NAME) {
+    console.error("[queue] QUEUE_BUCKET_NAME not set — queue persistence disabled");
+    return;
+  }
+  try {
+    jobQueue = await readQueueFromR2();
+    for (const job of jobQueue) {
+      if (job.status === "running") {
+        job.status = "queued";
+        job.started_at = null;
+        job.progress.current = 0;
+      }
+    }
+    await persistQueue();
+    if (jobQueue.some((j) => j.status === "queued")) startWorker();
+    console.error(`[queue] Restored ${jobQueue.length} job(s) from R2`);
+  } catch (e) {
+    console.error("[queue] Failed to restore from R2:", e.message);
+    jobQueue = [];
+  }
+}
+
+function startWorker() {
+  if (workerRunning) return;
+  workerRunning = true;
+  processNextJob().finally(() => { workerRunning = false; });
+}
+
+async function processNextJob() {
+  while (true) {
+    const job = jobQueue.find((j) => j.status === "queued");
+    if (!job) break;
+    job.status = "running";
+    job.started_at = new Date().toISOString();
+    await persistQueue();
+    try {
+      await runMigrationJob(job);
+      job.status = "done";
+    } catch (e) {
+      console.error(`[queue] Job ${job.id} failed:`, e.message);
+      job.status = "failed";
+      job.error = e.message;
+    }
+    job.completed_at = new Date().toISOString();
+    await persistQueue();
+  }
+}
+
+async function runMigrationJob(job) {
+  let tmpDir = null;
+
+  const sourceKeys = await listAllUploadKeys(SOURCE_BUCKET);
+  const destClipKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
+  const processedFilenames = new Set(destClipKeys.map((k) => path.basename(k)));
+
+  const unprocessed = sourceKeys.filter((k) => !processedFilenames.has(path.basename(k)));
+  const toProcess = unprocessed.slice(0, job.batch_size);
+
+  job.progress.total = toProcess.length;
+  job.progress.current = 0;
+  await persistQueue();
+
+  const allRecords = await getAllAirtableRecords(["source_url", "video_url", "thumbnail_url"]);
+  const recordBySourceUrl = new Map();
+  const recordByVideoUrl = new Map();
+  for (const rec of allRecords) {
+    if (rec.fields.source_url) recordBySourceUrl.set(String(rec.fields.source_url).trim(), rec.id);
+    if (rec.fields.video_url) recordByVideoUrl.set(String(rec.fields.video_url).trim(), rec.id);
+  }
+
+  const results = [];
+
+  for (const sourceKey of toProcess) {
+    tmpDir = null;
+    const filename = path.basename(sourceKey);
+    const basename = path.basename(sourceKey, path.extname(sourceKey));
+    const oldUrl = buildSourceUrl(sourceKey);
+    const newClipKey = `clips/${filename}`;
+    const newThumbKey = `thumbnails/${basename}.jpg`;
+    const newClipUrl = buildDestUrl(newClipKey);
+    const newThumbUrl = buildDestUrl(newThumbKey);
+
+    try {
+      const dl = await downloadToTempFile(oldUrl);
+      tmpDir = dl.tmpDir;
+      const stat = await fs.stat(dl.videoPath);
+      console.error(`[migrate] downloaded ${filename}: ${stat.size} bytes`);
+      const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
+
+      await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
+      await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
+
+      const existingBySource = recordBySourceUrl.get(oldUrl);
+      const existingByVideo = recordByVideoUrl.get(newClipUrl);
+
+      if (existingBySource) {
+        await updateAirtableRow({ recordId: existingBySource, fields: { video_url: newClipUrl, thumbnail_url: newThumbUrl } });
+        recordByVideoUrl.set(newClipUrl, existingBySource);
+        results.push({ filename, ok: true, action: "updated", airtableRecordId: existingBySource });
+      } else if (existingByVideo) {
+        await updateAirtableRow({ recordId: existingByVideo, fields: { source_url: oldUrl, thumbnail_url: newThumbUrl } });
+        recordBySourceUrl.set(oldUrl, existingByVideo);
+        results.push({ filename, ok: true, action: "source_linked", airtableRecordId: existingByVideo });
+      } else {
+        const rec = await createAirtableRow({ sourceUrl: oldUrl, videoUrl: newClipUrl, thumbnailUrl: newThumbUrl, status: "uploaded" });
+        recordBySourceUrl.set(oldUrl, rec.id);
+        recordByVideoUrl.set(newClipUrl, rec.id);
+        results.push({ filename, ok: true, action: "created", airtableRecordId: rec.id });
+      }
+    } catch (err) {
+      console.error("Migration failed for:", sourceKey, err);
+      results.push({ filename, ok: false, error: err.message });
+    } finally {
+      if (tmpDir) {
+        try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
+        tmpDir = null;
+      }
+    }
+
+    job.progress.current++;
+    await persistQueue();
+  }
+
+  const processed = results.filter((r) => r.ok).length;
+  const failed = results.filter((r) => !r.ok).length;
+  job.summary = {
+    source_total: sourceKeys.length,
+    already_processed: sourceKeys.length - unprocessed.length,
+    processed,
+    failed,
+    remaining: Math.max(0, unprocessed.length - toProcess.length),
+  };
 }
 
 function buildPublicUrl(baseUrl, key) {
@@ -563,111 +730,52 @@ app.post("/webhook", async (_req, res) => {
   }
 });
 
-// POST /migrate — process clips from content-machine into video-jobs-data/clips/
+// POST /migrate — queue a migration job and return immediately
 app.post("/migrate", async (req, res) => {
-  let tmpDir = null;
+  if (!SOURCE_BUCKET) return res.status(400).json({ ok: false, error: "SOURCE_BUCKET env var not set" });
+  if (!SOURCE_PUBLIC_URL) return res.status(400).json({ ok: false, error: "SOURCE_PUBLIC_URL env var not set" });
 
-  try {
-    if (!SOURCE_BUCKET) return res.status(400).json({ ok: false, error: "SOURCE_BUCKET env var not set" });
-    if (!SOURCE_PUBLIC_URL) return res.status(400).json({ ok: false, error: "SOURCE_PUBLIC_URL env var not set" });
-
-    const LIMIT = Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 20);
-
-    // List source and destination
-    const sourceKeys = await listAllUploadKeys(SOURCE_BUCKET);
-    const destClipKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
-    const processedFilenames = new Set(destClipKeys.map((k) => path.basename(k)));
-
-    const unprocessed = sourceKeys.filter((k) => !processedFilenames.has(path.basename(k)));
-    const toProcess = unprocessed.slice(0, LIMIT);
-
-    // Index records by source_url (to find existing records for this source clip)
-    // and by video_url (to detect already-processed clips from a previous run)
-    const allRecords = await getAllAirtableRecords(["source_url", "video_url", "thumbnail_url"]);
-    const recordBySourceUrl = new Map();
-    const recordByVideoUrl = new Map();
-    for (const rec of allRecords) {
-      if (rec.fields.source_url) recordBySourceUrl.set(String(rec.fields.source_url).trim(), rec.id);
-      if (rec.fields.video_url) recordByVideoUrl.set(String(rec.fields.video_url).trim(), rec.id);
-    }
-
-    const results = [];
-
-    for (const sourceKey of toProcess) {
-      tmpDir = null;
-      const filename = path.basename(sourceKey);
-      const basename = path.basename(sourceKey, path.extname(sourceKey));
-
-      const oldUrl = buildSourceUrl(sourceKey);
-      const newClipKey = `clips/${filename}`;
-      const newThumbKey = `thumbnails/${basename}.jpg`;
-      const newClipUrl = buildDestUrl(newClipKey);
-      const newThumbUrl = buildDestUrl(newThumbKey);
-
-      try {
-        const dl = await downloadToTempFile(oldUrl);
-        tmpDir = dl.tmpDir;
-        const stat = await fs.stat(dl.videoPath);
-        console.error(`[migrate] downloaded ${filename}: ${stat.size} bytes at ${dl.videoPath}`);
-        const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
-
-        await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
-        await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
-
-        // Match by source_url first (normal case), then video_url (already processed), else create
-        const existingBySource = recordBySourceUrl.get(oldUrl);
-        const existingByVideo = recordByVideoUrl.get(newClipUrl);
-
-        if (existingBySource) {
-          await updateAirtableRow({
-            recordId: existingBySource,
-            fields: { video_url: newClipUrl, thumbnail_url: newThumbUrl },
-          });
-          recordByVideoUrl.set(newClipUrl, existingBySource);
-          results.push({ filename, ok: true, action: "updated", airtableRecordId: existingBySource });
-        } else if (existingByVideo) {
-          // Clip was already processed in a prior run — backfill source_url and refresh thumbnail
-          await updateAirtableRow({
-            recordId: existingByVideo,
-            fields: { source_url: oldUrl, thumbnail_url: newThumbUrl },
-          });
-          recordBySourceUrl.set(oldUrl, existingByVideo);
-          results.push({ filename, ok: true, action: "source_linked", airtableRecordId: existingByVideo });
-        } else {
-          const rec = await createAirtableRow({
-            sourceUrl: oldUrl,
-            videoUrl: newClipUrl,
-            thumbnailUrl: newThumbUrl,
-            status: "uploaded",
-          });
-          recordBySourceUrl.set(oldUrl, rec.id);
-          recordByVideoUrl.set(newClipUrl, rec.id);
-          results.push({ filename, ok: true, action: "created", airtableRecordId: rec.id });
-        }
-      } catch (err) {
-        console.error("Migration failed for:", sourceKey, err);
-        results.push({ filename, ok: false, error: err.message });
-      } finally {
-        if (tmpDir) {
-          try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
-          tmpDir = null;
-        }
-      }
-    }
-
-    return res.json({
-      ok: true,
-      source_total: sourceKeys.length,
-      already_processed: sourceKeys.length - unprocessed.length,
-      new_found: unprocessed.length,
-      processed_now: toProcess.length,
-      remaining: Math.max(0, unprocessed.length - toProcess.length),
-      results,
-    });
-  } catch (e) {
-    console.error("Migration error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+  const queued = jobQueue.filter((j) => j.status === "queued");
+  if (queued.length >= 5) {
+    return res.status(409).json({ ok: false, error: "Queue is full (max 5 pending jobs)" });
   }
+
+  const job = {
+    id: `migrate_${Date.now()}`,
+    type: "migrate",
+    status: "queued",
+    created_at: new Date().toISOString(),
+    started_at: null,
+    completed_at: null,
+    batch_size: Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 20),
+    progress: { current: 0, total: 0 },
+    summary: null,
+    error: null,
+  };
+
+  jobQueue.push(job);
+  await persistQueue();
+  startWorker();
+
+  return res.json({ ok: true, jobId: job.id });
+});
+
+// GET /queue — return current job queue state
+app.get("/queue", (_req, res) => {
+  return res.json({ ok: true, jobs: [...jobQueue].reverse() });
+});
+
+// DELETE /queue/:jobId — cancel a queued job
+app.delete("/queue/:jobId", async (req, res) => {
+  const job = jobQueue.find((j) => j.id === req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (job.status !== "queued") {
+    return res.status(409).json({ ok: false, error: `Cannot cancel a ${job.status} job` });
+  }
+  job.status = "cancelled";
+  job.completed_at = new Date().toISOString();
+  await persistQueue();
+  return res.json({ ok: true, jobId: job.id });
 });
 
 // POST /sync-statuses — recalculate status for all records based on tag field completeness
@@ -815,4 +923,7 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Tagging service listening on port ${port}`));
+app.listen(port, async () => {
+  console.log(`Tagging service listening on port ${port}`);
+  await initQueue();
+});
