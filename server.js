@@ -50,7 +50,7 @@ const {
   SOURCE_BUCKET,        // migration source: content-machine
   SOURCE_PUBLIC_URL,    // public URL for content-machine
 
-  QUEUE_BUCKET_NAME,    // bucket for job queue persistence (video-jobs-queue)
+  JOB_DATA_BUCKET_NAME, // bucket for job queue persistence (page-data)
 
   NOTION_API_KEY,
   NOTION_PAGE_ID,
@@ -154,7 +154,7 @@ let workerRunning = false;
 
 async function readQueueFromR2() {
   try {
-    const resp = await r2.send(new GetObjectCommand({ Bucket: QUEUE_BUCKET_NAME, Key: "video_jobs_queue/queue.json" }));
+    const resp = await r2.send(new GetObjectCommand({ Bucket: JOB_DATA_BUCKET_NAME, Key: "video_jobs_queue/queue.json" }));
     const body = await resp.Body.transformToString();
     return JSON.parse(body);
   } catch (e) {
@@ -167,9 +167,9 @@ async function persistQueue() {
   const active = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
   const finished = jobQueue.filter((j) => !["queued", "running"].includes(j.status)).slice(-20);
   jobQueue = [...active, ...finished];
-  if (!QUEUE_BUCKET_NAME) return;
+  if (!JOB_DATA_BUCKET_NAME) return;
   await r2.send(new PutObjectCommand({
-    Bucket: QUEUE_BUCKET_NAME,
+    Bucket: JOB_DATA_BUCKET_NAME,
     Key: "video_jobs_queue/queue.json",
     Body: JSON.stringify(jobQueue),
     ContentType: "application/json",
@@ -177,8 +177,8 @@ async function persistQueue() {
 }
 
 async function initQueue() {
-  if (!QUEUE_BUCKET_NAME) {
-    console.error("[queue] QUEUE_BUCKET_NAME not set — queue persistence disabled");
+  if (!JOB_DATA_BUCKET_NAME) {
+    console.error("[queue] JOB_DATA_BUCKET_NAME not set — queue persistence disabled");
     return;
   }
   try {
