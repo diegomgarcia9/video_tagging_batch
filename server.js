@@ -179,7 +179,7 @@ async function processVideoForStorage(input, outputDir) {
   // halving per-frame memory before any other operation runs.
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg(input)
-      .inputOptions(["-cpuflags 0", "-t 5"])
+      .inputOptions(["-t 5"])
       .outputOptions([
         "-vf format=yuv420p,crop=if(gt(iw\\,ih)\\,ih*9/16\\,iw):if(gt(iw\\,ih)\\,ih\\,iw*16/9),scale=1080:1920,fps=30",
         "-c:v libx264",
