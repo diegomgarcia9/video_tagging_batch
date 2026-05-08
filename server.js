@@ -579,10 +579,9 @@ app.post("/migrate", async (req, res) => {
       const newThumbUrl = buildDestUrl(newThumbKey);
 
       try {
-        // FFmpeg reads directly from the source URL — no full download needed.
-        // The -t 5 input option means only ~5s of data is ever pulled from the source.
-        tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-"));
-        const { clipPath, thumbPath } = await processVideoForStorage(oldUrl, tmpDir);
+        const dl = await downloadToTempFile(oldUrl);
+        tmpDir = dl.tmpDir;
+        const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
 
         await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
         await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
