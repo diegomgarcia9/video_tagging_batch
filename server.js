@@ -17,6 +17,7 @@ import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
+import { execSync } from "child_process";
 
 const app = express();
 
@@ -27,6 +28,14 @@ import ffprobeStatic from "ffprobe-static";
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobeStatic.path);
+
+try {
+  const version = execSync(`"${ffmpegPath}" -version 2>&1`, { timeout: 5000 }).toString().split("\n")[0];
+  console.error(`[startup] ffmpeg binary: ${ffmpegPath}`);
+  console.error(`[startup] ffmpeg version: ${version}`);
+} catch (e) {
+  console.error(`[startup] ffmpeg binary FAILED TO RUN: ${ffmpegPath} — ${e.message}`);
+}
 
 const {
   R2_ACCOUNT_ID,
