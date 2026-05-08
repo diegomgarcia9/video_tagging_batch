@@ -169,15 +169,19 @@ async function processVideoForStorage(input, outputDir) {
   const thumbPath = path.join(outputDir, "thumb.jpg");
 
   // Center-crop to 9:16 then scale to 1080x1920.
-  // crop=ih*9/16:ih takes the center 9:16 slice of any source aspect ratio.
-  // Combining crop+scale+fps in one -vf pass avoids multiple decode steps.
+  // -threads 1 reduces decoder frame buffer count — critical for 4K sources which
+  // need ~200MB+ just for reference frame buffers at full parallelism.
+  // -preset ultrafast reduces encoder memory at the cost of slightly larger output.
   await new Promise((resolve, reject) => {
     ffmpeg(input)
       .inputOptions(["-t 5"])
       .outputOptions([
         "-vf crop=ih*9/16:ih,scale=1080:1920,fps=30",
         "-c:v libx264",
-        "-c:a aac",
+        "-pix_fmt yuv420p",
+        "-preset ultrafast",
+        "-threads 1",
+        "-an",
         "-movflags +faststart",
       ])
       .output(clipPath)
@@ -186,11 +190,12 @@ async function processVideoForStorage(input, outputDir) {
       .run();
   });
 
-  // Thumbnail: same crop+scale at half resolution (540x960)
+  // Extract thumbnail from the already-processed clip (1080x1920, ~few MB) —
+  // never decode the 4K source a second time, which is what caused SIGSEGV.
   await new Promise((resolve, reject) => {
-    ffmpeg(input)
-      .inputOptions(["-ss 1.667", "-t 1"])
-      .outputOptions(["-vf crop=ih*9/16:ih,scale=540:960", "-frames:v 1", "-q:v 2"])
+    ffmpeg(clipPath)
+      .inputOptions(["-ss 1.667"])
+      .outputOptions(["-frames:v 1", "-q:v 2"])
       .output(thumbPath)
       .on("end", resolve)
       .on("error", reject)
