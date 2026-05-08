@@ -168,22 +168,29 @@ async function processVideoForStorage(input, outputDir) {
   const clipPath = path.join(outputDir, "clip.mp4");
   const thumbPath = path.join(outputDir, "thumb.jpg");
 
-  // -t 5 as an input option stops FFmpeg reading the source after 5 seconds
+  // Center-crop to 9:16 then scale to 1080x1920.
+  // crop=ih*9/16:ih takes the center 9:16 slice of any source aspect ratio.
+  // Combining crop+scale+fps in one -vf pass avoids multiple decode steps.
   await new Promise((resolve, reject) => {
     ffmpeg(input)
       .inputOptions(["-t 5"])
-      .outputOptions(["-r 30", "-c:v libx264", "-c:a aac", "-movflags +faststart"])
+      .outputOptions([
+        "-vf crop=ih*9/16:ih,scale=1080:1920,fps=30",
+        "-c:v libx264",
+        "-c:a aac",
+        "-movflags +faststart",
+      ])
       .output(clipPath)
       .on("end", resolve)
       .on("error", reject)
       .run();
   });
 
-  // Seek directly to frame 50 position in the source (fast seek, no full decode)
+  // Thumbnail: same crop+scale at half resolution (540x960)
   await new Promise((resolve, reject) => {
     ffmpeg(input)
       .inputOptions(["-ss 1.667", "-t 1"])
-      .outputOptions(["-frames:v 1", "-q:v 2"])
+      .outputOptions(["-vf crop=ih*9/16:ih,scale=540:960", "-frames:v 1", "-q:v 2"])
       .output(thumbPath)
       .on("end", resolve)
       .on("error", reject)
