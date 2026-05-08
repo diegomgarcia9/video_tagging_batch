@@ -576,18 +576,6 @@ app.post("/migrate", async (req, res) => {
       const newThumbUrl = buildDestUrl(newThumbKey);
 
       try {
-        // Probe before processing — identifies codec/format and surfaces files
-        // that ffprobe can't read at all (truly broken or unsupported format).
-        let probeInfo;
-        try {
-          probeInfo = await probeVideo(oldUrl);
-          console.log(`[migrate] ${filename} codec=${probeInfo.codec} pix_fmt=${probeInfo.pixFmt} size=${probeInfo.width}x${probeInfo.height}`);
-        } catch (probeErr) {
-          console.warn(`[migrate] ffprobe failed for ${filename}: ${probeErr.message} — skipping`);
-          results.push({ filename, ok: false, skipped: true, error: `ffprobe: ${probeErr.message}` });
-          continue;
-        }
-
         // FFmpeg reads directly from the source URL — no full download needed.
         // The -t 5 input option means only ~5s of data is ever pulled from the source.
         tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-"));
