@@ -118,12 +118,13 @@ async function doesKeyExist(bucket, key) {
   }
 }
 
-async function uploadBufferToR2(bucket, key, buffer, contentType) {
+async function uploadFileToR2(bucket, key, filePath, contentType) {
+  const stream = createReadStream(filePath);
   await r2.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: key,
-      Body: buffer,
+      Body: stream,
       ContentType: contentType,
     })
   );
@@ -538,12 +539,11 @@ app.post("/migrate", async (req, res) => {
         // Process: 30fps, 5s trim, thumbnail at frame 50
         const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
 
-        // Upload clip and thumbnail to destination
-        const clipBuffer = await fs.readFile(clipPath);
-        const thumbBuffer = await fs.readFile(thumbPath);
+        // Free the large source file from disk before uploading
+        try { await fs.unlink(dl.videoPath); } catch {}
 
-        await uploadBufferToR2(R2_BUCKET_NAME, newClipKey, clipBuffer, "video/mp4");
-        await uploadBufferToR2(R2_BUCKET_NAME, newThumbKey, thumbBuffer, "image/jpeg");
+        await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
+        await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
 
         // Find existing Airtable record by old URL, new URL, or create
         const existingByOld = recordByUrl.get(oldUrl);
@@ -708,11 +708,11 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "upload-"));
     const { clipPath, thumbPath } = await processVideoForStorage(uploadedPath, tmpDir);
 
-    const clipBuffer = await fs.readFile(clipPath);
-    const thumbBuffer = await fs.readFile(thumbPath);
+    // Delete source upload before streaming processed files to R2
+    try { await fs.unlink(uploadedPath); } catch {}
 
-    await uploadBufferToR2(R2_BUCKET_NAME, newClipKey, clipBuffer, "video/mp4");
-    await uploadBufferToR2(R2_BUCKET_NAME, newThumbKey, thumbBuffer, "image/jpeg");
+    await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
+    await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
 
     const newClipUrl = buildDestUrl(newClipKey);
     const newThumbUrl = buildDestUrl(newThumbKey);
