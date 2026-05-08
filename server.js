@@ -181,7 +181,7 @@ async function processVideoForStorage(input, outputDir) {
     ffmpeg(input)
       .inputOptions(["-cpuflags 0", "-t 5"])
       .outputOptions([
-        "-vf format=yuv420p,crop=ih*9/16:ih,scale=1080:1920,fps=30",
+        "-vf format=yuv420p,crop=if(gt(iw\\,ih)\\,ih*9/16\\,iw):if(gt(iw\\,ih)\\,ih\\,iw*16/9),scale=1080:1920,fps=30",
         "-c:v libx264",
         "-pix_fmt yuv420p",
         "-preset ultrafast",
