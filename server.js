@@ -214,7 +214,10 @@ async function processVideoForStorage(input, outputDir) {
 // Throws if ffprobe cannot read the file — caller should skip/log gracefully.
 async function probeVideo(input) {
   return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(input, (err, metadata) => {
+    // -cpuflags 0 disables SIMD in ffprobe for the same reason we disable it in
+    // ffmpeg: the 2018-era static binary crashes with SIGSEGV on 4096-wide frames
+    // due to AVX2/SSE alignment assumptions that don't hold at power-of-2 widths.
+    ffmpeg.ffprobe(input, ["-cpuflags", "0"], (err, metadata) => {
       if (err) return reject(err);
       const videoStream = (metadata.streams || []).find((s) => s.codec_type === "video");
       if (!videoStream) return reject(new Error("No video stream found"));
