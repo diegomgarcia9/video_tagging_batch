@@ -26,15 +26,17 @@ app.use(express.json({ limit: "1mb" }));
 
 import ffprobeStatic from "ffprobe-static";
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobeStatic.path);
+// Use system ffmpeg (installed via apt-get during Render build) rather than
+// ffmpeg-static, whose pre-compiled binary fails to run on Render's Linux env
+// due to a GLIBC version mismatch.
+ffmpeg.setFfmpegPath("ffmpeg");
+ffmpeg.setFfprobePath("ffprobe");
 
 try {
-  const version = execSync(`"${ffmpegPath}" -version 2>&1`, { timeout: 5000 }).toString().split("\n")[0];
-  console.error(`[startup] ffmpeg binary: ${ffmpegPath}`);
+  const version = execSync("ffmpeg -version 2>&1", { timeout: 5000 }).toString().split("\n")[0];
   console.error(`[startup] ffmpeg version: ${version}`);
 } catch (e) {
-  console.error(`[startup] ffmpeg binary FAILED TO RUN: ${ffmpegPath} — ${e.message}`);
+  console.error(`[startup] ffmpeg FAILED TO RUN — is ffmpeg installed? ${e.message}`);
 }
 
 const {
