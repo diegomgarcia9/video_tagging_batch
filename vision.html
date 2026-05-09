@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Video Creation Platform - Product Vision</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+@page {
+  size: A4 portrait;
+  margin: 0;
+}
+
+body {
+  font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  width: 210mm;
+  min-height: 297mm;
+  padding: 28px 32px;
+}
+
+/* HEADER */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #21262d;
+  margin-bottom: 18px;
+}
+
+.header-title {
+  font-size: 26px;
+  font-weight: 800;
+  color: #58a6ff;
+  letter-spacing: -0.5px;
+}
+
+.header-sub {
+  font-size: 11px;
+  color: #8b949e;
+  margin-top: 5px;
+  max-width: 420px;
+  line-height: 1.5;
+}
+
+.badge {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 20px;
+  padding: 5px 13px;
+  font-size: 10px;
+  color: #8b949e;
+  font-weight: 500;
+  white-space: nowrap;
+  margin-top: 4px;
+}
+
+/* PIPELINE */
+.pipeline {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+
+.section-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: #8b949e;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.pipeline-steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.step {
+  flex: 1;
+  text-align: center;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 12px 6px;
+}
+
+.step-num {
+  width: 22px;
+  height: 22px;
+  background: #58a6ff;
+  color: #0d1117;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 6px auto;
+}
+
+.step-name {
+  font-size: 10px;
+  font-weight: 700;
+  color: #e6edf3;
+}
+
+.step-sub {
+  font-size: 9px;
+  color: #58a6ff;
+  margin-top: 2px;
+}
+
+.arrow {
+  color: #30363d;
+  font-size: 20px;
+  font-weight: 300;
+  flex-shrink: 0;
+}
+
+/* GRIDS */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.three-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+/* PROBLEM CARDS */
+.problem-card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 18px;
+  border-top: 3px solid transparent;
+}
+
+.problem-card.blue { border-top-color: #58a6ff; }
+.problem-card.green { border-top-color: #3fb950; }
+
+.problem-num {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  font-weight: 700;
+  margin-bottom: 7px;
+}
+
+.blue .problem-num { color: #58a6ff; }
+.green .problem-num { color: #3fb950; }
+
+.problem-card h3 {
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 7px;
+  line-height: 1.3;
+  color: #e6edf3;
+}
+
+.problem-card p {
+  font-size: 10.5px;
+  color: #8b949e;
+  line-height: 1.6;
+}
+
+/* MODULE CARDS */
+.module-card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.module-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #21262d;
+}
+
+.module-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-blue { background: #58a6ff; }
+.dot-purple { background: #a371f7; }
+.dot-orange { background: #f0883e; }
+
+.module-card h3 {
+  font-size: 13px;
+  font-weight: 700;
+  color: #e6edf3;
+}
+
+.module-items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.module-items li {
+  font-size: 10px;
+  color: #8b949e;
+  padding-left: 12px;
+  position: relative;
+  line-height: 1.45;
+}
+
+.module-items li::before {
+  content: '>';
+  position: absolute;
+  left: 0;
+  color: #58a6ff;
+  font-weight: 700;
+  font-size: 9px;
+}
+
+/* BOTTOM ROW */
+.bottom-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.final-card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-left: 3px solid #58a6ff;
+  border-radius: 10px;
+  padding: 18px;
+}
+
+.final-card h3 {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: #58a6ff;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.final-items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.final-items li {
+  font-size: 10.5px;
+  color: #8b949e;
+  padding-left: 14px;
+  position: relative;
+  line-height: 1.5;
+}
+
+.final-items li::before {
+  content: '->';
+  position: absolute;
+  left: 0;
+  color: #58a6ff;
+  font-size: 9px;
+}
+
+.good-card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-left: 3px solid #3fb950;
+  border-radius: 10px;
+  padding: 18px;
+}
+
+.good-card h3 {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: #3fb950;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.good-items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.good-items li {
+  font-size: 10.5px;
+  color: #8b949e;
+  padding-left: 14px;
+  position: relative;
+  line-height: 1.5;
+}
+
+.good-items li::before {
+  content: 'v';
+  position: absolute;
+  left: 0;
+  color: #3fb950;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+/* FOOTER */
+.footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid #21262d;
+  padding-top: 12px;
+}
+
+.footer-note {
+  font-size: 9px;
+  color: #484f58;
+}
+
+.tags {
+  display: flex;
+  gap: 6px;
+}
+
+.tag {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 9px;
+  color: #8b949e;
+}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div>
+    <div class="header-title">Video Creation Platform</div>
+    <div class="header-sub">High-volume automated short-form video creation — built for scale across multiple niches</div>
+  </div>
+  <div class="badge">Internal Vision Document</div>
+</div>
+
+<!-- PIPELINE -->
+<div class="pipeline">
+  <div class="section-label">Core Production Pipeline</div>
+  <div class="pipeline-steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-name">Script Gen</div>
+      <div class="step-sub">AI-generated</div>
+    </div>
+    <div class="arrow">></div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-name">Voiceover</div>
+      <div class="step-sub">ElevenLabs</div>
+    </div>
+    <div class="arrow">></div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-name">Clip Matching</div>
+      <div class="step-sub">Tag-based search</div>
+    </div>
+    <div class="arrow">></div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-name">Assembly</div>
+      <div class="step-sub">Remotion</div>
+    </div>
+    <div class="arrow">></div>
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-name">Render</div>
+      <div class="step-sub">Final output</div>
+    </div>
+  </div>
+</div>
+
+<!-- TWO CORE PROBLEMS -->
+<div class="two-col">
+  <div class="problem-card blue">
+    <div class="problem-num">Core Problem 01</div>
+    <h3>Right Clips, Right Moment</h3>
+    <p>Sourcing and matching clips that fit the context, tone, and visual intent of each script segment — through intelligent tagging, matching formulas, and automated clip acquisition.</p>
+  </div>
+  <div class="problem-card green">
+    <div class="problem-num">Core Problem 02</div>
+    <h3>Polished, Not Templated</h3>
+    <p>Videos that feel intentional — word-level captions, mood-matched music, rhythm-aligned cuts, and consistent visual style. Automated quality that scales without sacrificing craft.</p>
+  </div>
+</div>
+
+<!-- THREE MODULES -->
+<div class="three-col">
+  <div class="module-card">
+    <div class="module-header">
+      <div class="module-dot dot-blue"></div>
+      <h3>Studio</h3>
+    </div>
+    <ul class="module-items">
+      <li>Videos by status: Script, Assembly, Rendering, Completed</li>
+      <li>Script generation and voiceover review</li>
+      <li>Clip match review and assembly editing</li>
+      <li>Render trigger and completed video history</li>
+    </ul>
+  </div>
+  <div class="module-card">
+    <div class="module-header">
+      <div class="module-dot dot-purple"></div>
+      <h3>Library</h3>
+    </div>
+    <ul class="module-items">
+      <li>Clip management and tagging status</li>
+      <li>Voice management via ElevenLabs</li>
+      <li>Prompt management: script, tagging, matching</li>
+      <li>Batch tagging triggers and oversight</li>
+    </ul>
+  </div>
+  <div class="module-card">
+    <div class="module-header">
+      <div class="module-dot dot-orange"></div>
+      <h3>Analytics</h3>
+    </div>
+    <ul class="module-items">
+      <li>Video output and render metrics</li>
+      <li>Clip usage and library coverage data</li>
+      <li>Social performance integration</li>
+      <li>Feedback loop into prompt and strategy tuning</li>
+    </ul>
+  </div>
+</div>
+
+<!-- BOTTOM ROW -->
+<div class="bottom-row">
+  <div class="final-card">
+    <h3>The Final System</h3>
+    <ul class="final-items">
+      <li>Minimal manual intervention from brief to rendered video</li>
+      <li>Clip library sourced via uploads and automated acquisition</li>
+      <li>Intelligent matching across context, tone, and visual intent</li>
+      <li>Word-level captions, mood-matched music, rhythm-aligned cuts</li>
+      <li>Visual style and color grading adapted per niche</li>
+    </ul>
+  </div>
+  <div class="good-card">
+    <h3>What Good Looks Like</h3>
+    <ul class="good-items">
+      <li>Assembly requires minimal clip swaps per video</li>
+      <li>Clip matches feel intentional, not random</li>
+      <li>Operator time on strategy and quality — not fixing videos</li>
+      <li>Consistent output quality across niches at scale</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+  <div class="footer-note">Internal document · Not for external distribution</div>
+  <div class="tags">
+    <span class="tag">Automation</span>
+    <span class="tag">Short-form Video</span>
+    <span class="tag">AI-powered</span>
+    <span class="tag">Multi-niche</span>
+  </div>
+</div>
+
+</body>
+</html>
