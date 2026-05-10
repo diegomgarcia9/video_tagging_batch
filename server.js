@@ -628,24 +628,18 @@ function computeStatus(fields) {
   const current = String(fields.status || "").toLowerCase();
   if (current === "processing") return null;
 
-  const URL_FIELDS = ["video_url", "thumbnail_url", "source_url"];
-  const hasAllUrls = URL_FIELDS.every((f) => {
-    const val = fields[f];
-    return val && String(val).trim().length > 0;
-  });
-
-  const filledTags = TAG_FIELDS.filter((f) => {
-    const val = fields[f];
+  function isFilled(val) {
     if (Array.isArray(val)) return val.length > 0;
-    return val && String(val).trim().length > 0;
-  });
+    return val != null && String(val).trim().length > 0;
+  }
 
-  // All URL fields + all tag fields → tagged
-  if (hasAllUrls && filledTags.length === TAG_FIELDS.length) return "tagged";
-  // All URL fields + zero tag fields → uploaded
-  if (hasAllUrls && filledTags.length === 0) return "uploaded";
-  // Anything else (missing URL fields, or partial tags) → incomplete
-  return "incomplete";
+  const allFilled = [...TAG_FIELDS, "video_url", "thumbnail_url", "source_url"]
+    .every((f) => isFilled(fields[f]));
+
+  if (allFilled)                          return "tagged";
+  if (isFilled(fields.short_description)) return "incomplete";
+  if (isFilled(fields.video_url))         return "uploaded";
+  return null;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
