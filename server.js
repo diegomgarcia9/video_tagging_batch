@@ -747,7 +747,7 @@ app.post("/migrate", async (req, res) => {
     created_at: new Date().toISOString(),
     started_at: null,
     completed_at: null,
-    batch_size: Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 20),
+    batch_size: Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 5),
     progress: { current: 0, total: 0 },
     summary: null,
     error: null,
@@ -763,6 +763,39 @@ app.post("/migrate", async (req, res) => {
 // GET /queue — return current job queue state
 app.get("/queue", (_req, res) => {
   return res.json({ ok: true, jobs: [...jobQueue].reverse() });
+});
+
+// POST /queue/reset — reset any stuck "running" jobs back to "queued" and resume the worker.
+// Use this after a crash where the service restarted but initQueue didn't run cleanly,
+// or when you want to force-retry without a full Render restart.
+app.post("/queue/reset", async (req, res) => {
+  const reset = [];
+  for (const job of jobQueue) {
+    if (job.status === "running") {
+      job.status = "queued";
+      job.started_at = null;
+      job.progress.current = 0;
+      reset.push(job.id);
+    }
+  }
+  await persistQueue();
+  if (jobQueue.some((j) => j.status === "queued")) startWorker();
+  return res.json({ ok: true, reset });
+});
+
+// POST /queue/clear — cancel all queued and running jobs (leaves finished history intact).
+// Use this to drain the queue before a restart when you want a clean slate.
+app.post("/queue/clear", async (req, res) => {
+  const cleared = [];
+  for (const job of jobQueue) {
+    if (["queued", "running"].includes(job.status)) {
+      job.status = "cancelled";
+      job.completed_at = new Date().toISOString();
+      cleared.push(job.id);
+    }
+  }
+  await persistQueue();
+  return res.json({ ok: true, cleared });
 });
 
 // DELETE /queue/:jobId — cancel a queued job
