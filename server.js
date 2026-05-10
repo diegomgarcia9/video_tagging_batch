@@ -626,18 +626,26 @@ async function getAllAirtableVideoUrls() {
 
 function computeStatus(fields) {
   const current = String(fields.status || "").toLowerCase();
-  // Don't overwrite these states — they're set by active processes
   if (current === "processing") return null;
 
-  const filledTags = TAG_FIELDS.filter((f) => {
+  const URL_FIELDS = ["video_url", "thumbnail_url", "source_url"];
+  const hasAllUrls = URL_FIELDS.every((f) => {
     const val = fields[f];
     return val && String(val).trim().length > 0;
   });
 
-  if (filledTags.length === TAG_FIELDS.length) return "tagged";
-  if (filledTags.length > 0) return "incomplete";
-  if (fields.video_url) return "uploaded";
-  return null;
+  const filledTags = TAG_FIELDS.filter((f) => {
+    const val = fields[f];
+    if (Array.isArray(val)) return val.length > 0;
+    return val && String(val).trim().length > 0;
+  });
+
+  // All URL fields + all tag fields → tagged
+  if (hasAllUrls && filledTags.length === TAG_FIELDS.length) return "tagged";
+  // All URL fields + zero tag fields → uploaded
+  if (hasAllUrls && filledTags.length === 0) return "uploaded";
+  // Anything else (missing URL fields, or partial tags) → incomplete
+  return "incomplete";
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -814,7 +822,7 @@ app.delete("/queue/:jobId", async (req, res) => {
 // POST /sync-statuses — recalculate status for all records based on tag field completeness
 app.post("/sync-statuses", async (_req, res) => {
   try {
-    const allRecords = await getAllAirtableRecords(["video_url", "status", ...TAG_FIELDS]);
+    const allRecords = await getAllAirtableRecords(["video_url", "thumbnail_url", "source_url", "status", ...TAG_FIELDS]);
 
     let updated = 0;
     let skipped = 0;
