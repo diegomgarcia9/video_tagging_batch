@@ -150,28 +150,30 @@ async function uploadFileToR2(bucket, key, filePath, contentType) {
 // ── Job queue ─────────────────────────────────────────────────────────────────
 
 let jobQueue = [];
+let lastCompletion = null; // { processed, failed, remaining, done_at, job_status, error }
+let autoRemoved = null;    // { count, total_processed, total_failed, last_done_at }
 let workerRunning = false;
 
 async function readQueueFromR2() {
   try {
     const resp = await r2.send(new GetObjectCommand({ Bucket: JOB_DATA_BUCKET_NAME, Key: "video_jobs_queue/queue.json" }));
     const body = await resp.Body.transformToString();
-    return JSON.parse(body);
+    const data = JSON.parse(body);
+    if (Array.isArray(data)) return { jobs: data, lastCompletion: null, autoRemoved: null };
+    return data;
   } catch (e) {
-    if (e.name === "NoSuchKey" || e.$metadata?.httpStatusCode === 404) return [];
+    if (e.name === "NoSuchKey" || e.$metadata?.httpStatusCode === 404) return { jobs: [], lastCompletion: null, autoRemoved: null };
     throw e;
   }
 }
 
 async function persistQueue() {
-  const active = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
-  const finished = jobQueue.filter((j) => !["queued", "running"].includes(j.status)).slice(-20);
-  jobQueue = [...active, ...finished];
+  jobQueue = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
   if (!JOB_DATA_BUCKET_NAME) return;
   await r2.send(new PutObjectCommand({
     Bucket: JOB_DATA_BUCKET_NAME,
     Key: "video_jobs_queue/queue.json",
-    Body: JSON.stringify(jobQueue),
+    Body: JSON.stringify({ jobs: jobQueue, lastCompletion, autoRemoved }),
     ContentType: "application/json",
   }));
 }
@@ -182,7 +184,10 @@ async function initQueue() {
     return;
   }
   try {
-    jobQueue = await readQueueFromR2();
+    const data = await readQueueFromR2();
+    jobQueue       = data.jobs           || [];
+    lastCompletion = data.lastCompletion || null;
+    autoRemoved    = data.autoRemoved    || null;
     for (const job of jobQueue) {
       if (job.status === "running") {
         job.status = "queued";
@@ -197,6 +202,25 @@ async function initQueue() {
     console.error("[queue] Failed to restore from R2:", e.message);
     jobQueue = [];
   }
+}
+
+function recordJobCompletion(job) {
+  const newCompletion = {
+    processed:  job.summary?.processed ?? 0,
+    failed:     job.summary?.failed    ?? 0,
+    remaining:  job.summary?.remaining ?? 0,
+    done_at:    job.completed_at,
+    job_status: job.status,
+    error:      job.error || null,
+  };
+  if (lastCompletion !== null) {
+    if (!autoRemoved) autoRemoved = { count: 0, total_processed: 0, total_failed: 0, last_done_at: null };
+    autoRemoved.count++;
+    autoRemoved.total_processed += lastCompletion.processed;
+    autoRemoved.total_failed    += lastCompletion.failed;
+    autoRemoved.last_done_at     = lastCompletion.done_at;
+  }
+  lastCompletion = newCompletion;
 }
 
 function startWorker() {
@@ -221,6 +245,8 @@ async function processNextJob() {
       job.error = e.message;
     }
     job.completed_at = new Date().toISOString();
+    recordJobCompletion(job);
+    // Remove from queue — persistQueue filters to active-only anyway
     await persistQueue();
   }
 }
@@ -762,9 +788,10 @@ app.post("/migrate", async (req, res) => {
   return res.json({ ok: true, jobId: job.id });
 });
 
-// GET /queue — return current job queue state
+// GET /queue — return active jobs + completion status + auto-removed summary
 app.get("/queue", (_req, res) => {
-  return res.json({ ok: true, jobs: [...jobQueue].reverse() });
+  const activeJobs = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
+  return res.json({ ok: true, jobs: activeJobs, lastCompletion, autoRemoved });
 });
 
 // POST /queue/reset — reset any stuck "running" jobs back to "queued" and resume the worker.
@@ -785,32 +812,38 @@ app.post("/queue/reset", async (req, res) => {
   return res.json({ ok: true, reset });
 });
 
-// POST /queue/clear — cancel all queued and running jobs (leaves finished history intact).
-// Use this to drain the queue before a restart when you want a clean slate.
+// POST /queue/clear — remove all queued and running jobs entirely.
 app.post("/queue/clear", async (req, res) => {
-  const cleared = [];
-  for (const job of jobQueue) {
-    if (["queued", "running"].includes(job.status)) {
-      job.status = "cancelled";
-      job.completed_at = new Date().toISOString();
-      cleared.push(job.id);
-    }
-  }
+  const cleared = jobQueue.filter((j) => ["queued", "running"].includes(j.status)).map((j) => j.id);
+  jobQueue = jobQueue.filter((j) => !["queued", "running"].includes(j.status));
   await persistQueue();
   return res.json({ ok: true, cleared });
 });
 
-// DELETE /queue/:jobId — cancel a queued job
+// DELETE /queue/:jobId — remove a queued job
 app.delete("/queue/:jobId", async (req, res) => {
-  const job = jobQueue.find((j) => j.id === req.params.jobId);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
-  if (job.status !== "queued") {
-    return res.status(409).json({ ok: false, error: `Cannot cancel a ${job.status} job` });
+  const idx = jobQueue.findIndex((j) => j.id === req.params.jobId);
+  if (idx === -1) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (jobQueue[idx].status !== "queued") {
+    return res.status(409).json({ ok: false, error: `Cannot cancel a ${jobQueue[idx].status} job` });
   }
-  job.status = "cancelled";
-  job.completed_at = new Date().toISOString();
+  jobQueue.splice(idx, 1);
   await persistQueue();
-  return res.json({ ok: true, jobId: job.id });
+  return res.json({ ok: true, jobId: req.params.jobId });
+});
+
+// POST /queue/dismiss-completion — user dismissed the completion status message
+app.post("/queue/dismiss-completion", async (_req, res) => {
+  lastCompletion = null;
+  await persistQueue();
+  return res.json({ ok: true });
+});
+
+// POST /queue/dismiss-auto-removed — user dismissed the auto-removed summary
+app.post("/queue/dismiss-auto-removed", async (_req, res) => {
+  autoRemoved = null;
+  await persistQueue();
+  return res.json({ ok: true });
 });
 
 // POST /sync-statuses — recalculate status for all records based on tag field completeness
