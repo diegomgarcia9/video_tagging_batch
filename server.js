@@ -12,14 +12,11 @@ import os from "os";
 import {
   S3Client,
   ListObjectsV2Command,
-  HeadObjectCommand,
   PutObjectCommand,
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
-import { Client as NotionClient } from "@notionhq/client";
 import OpenAI from "openai";
 import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import { execSync } from "child_process";
 
@@ -29,6 +26,9 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 import ffprobeStatic from "ffprobe-static";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Use system ffmpeg (installed via apt-get during Render build) rather than
 // ffmpeg-static, whose pre-compiled binary fails to run on Render's Linux env
@@ -44,38 +44,34 @@ try {
 }
 
 const {
-  R2_ACCOUNT_ID,
+  CF_ACCOUNT_ID,
   R2_ACCESS_KEY_ID,
   R2_SECRET_ACCESS_KEY,
   R2_BUCKET_NAME,       // destination bucket: video-jobs-data
   R2_PUBLIC_BASE_URL,   // public URL for video-jobs-data
-
-  SOURCE_BUCKET,        // migration source: content-machine
-  SOURCE_PUBLIC_URL,    // public URL for content-machine
-
-  JOB_DATA_BUCKET_NAME, // bucket for job queue persistence (page-data)
-
-  NOTION_API_KEY,
-  NOTION_PAGE_ID,
-
   OPENAI_API_KEY,
   OPENAI_VISION_MODEL,
-
-  AIRTABLE_API_KEY,
-  AIRTABLE_BASE_ID,
-  AIRTABLE_TABLE_NAME,
 } = process.env;
+
+const REQUIRED_ENV = [
+  "CF_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+  "R2_BUCKET_NAME", "R2_PUBLIC_BASE_URL",
+  "OPENAI_API_KEY",
+  "SUPABASE_URL", "SUPABASE_SERVICE_KEY",
+];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) throw new Error(`Missing required env var: ${key}`);
+}
 
 const r2 = new S3Client({
   region: "auto",
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  endpoint: `https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
 });
 
-const notion = new NotionClient({ auth: NOTION_API_KEY });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 const upload = multer({
@@ -129,15 +125,6 @@ async function listAllUploadKeys(bucket, prefix = "") {
   return keys;
 }
 
-async function doesKeyExist(bucket, key) {
-  try {
-    await r2.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function uploadFileToR2(bucket, key, filePath, contentType) {
   const stream = createReadStream(filePath);
   await r2.send(
@@ -148,196 +135,6 @@ async function uploadFileToR2(bucket, key, filePath, contentType) {
       ContentType: contentType,
     })
   );
-}
-
-// ── Job queue ─────────────────────────────────────────────────────────────────
-
-let jobQueue = [];
-let lastCompletion = null; // { processed, failed, remaining, done_at, job_status, error }
-let autoRemoved = null;    // { count, total_processed, total_failed, last_done_at }
-let workerRunning = false;
-
-async function readQueueFromR2() {
-  try {
-    const resp = await r2.send(new GetObjectCommand({ Bucket: JOB_DATA_BUCKET_NAME, Key: "video_jobs_queue/queue.json" }));
-    const body = await resp.Body.transformToString();
-    const data = JSON.parse(body);
-    if (Array.isArray(data)) return { jobs: data, lastCompletion: null, autoRemoved: null };
-    return data;
-  } catch (e) {
-    if (e.name === "NoSuchKey" || e.$metadata?.httpStatusCode === 404) return { jobs: [], lastCompletion: null, autoRemoved: null };
-    throw e;
-  }
-}
-
-async function persistQueue() {
-  jobQueue = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
-  if (!JOB_DATA_BUCKET_NAME) return;
-  await r2.send(new PutObjectCommand({
-    Bucket: JOB_DATA_BUCKET_NAME,
-    Key: "video_jobs_queue/queue.json",
-    Body: JSON.stringify({ jobs: jobQueue, lastCompletion, autoRemoved }),
-    ContentType: "application/json",
-  }));
-}
-
-async function initQueue() {
-  if (!JOB_DATA_BUCKET_NAME) {
-    console.error("[queue] JOB_DATA_BUCKET_NAME not set — queue persistence disabled");
-    return;
-  }
-  try {
-    const data = await readQueueFromR2();
-    jobQueue       = data.jobs           || [];
-    lastCompletion = data.lastCompletion || null;
-    autoRemoved    = data.autoRemoved    || null;
-    for (const job of jobQueue) {
-      if (job.status === "running") {
-        job.status = "queued";
-        job.started_at = null;
-        job.progress.current = 0;
-      }
-    }
-    await persistQueue();
-    if (jobQueue.some((j) => j.status === "queued")) startWorker();
-    console.error(`[queue] Restored ${jobQueue.length} job(s) from R2`);
-  } catch (e) {
-    console.error("[queue] Failed to restore from R2:", e.message);
-    jobQueue = [];
-  }
-}
-
-function recordJobCompletion(job) {
-  const newCompletion = {
-    processed:  job.summary?.processed ?? 0,
-    failed:     job.summary?.failed    ?? 0,
-    remaining:  job.summary?.remaining ?? 0,
-    done_at:    job.completed_at,
-    job_status: job.status,
-    error:      job.error || null,
-  };
-  if (lastCompletion !== null) {
-    if (!autoRemoved) autoRemoved = { count: 0, total_processed: 0, total_failed: 0, last_done_at: null };
-    autoRemoved.count++;
-    autoRemoved.total_processed += lastCompletion.processed;
-    autoRemoved.total_failed    += lastCompletion.failed;
-    autoRemoved.last_done_at     = lastCompletion.done_at;
-  }
-  lastCompletion = newCompletion;
-}
-
-function startWorker() {
-  if (workerRunning) return;
-  workerRunning = true;
-  processNextJob().finally(() => { workerRunning = false; });
-}
-
-async function processNextJob() {
-  while (true) {
-    const job = jobQueue.find((j) => j.status === "queued");
-    if (!job) break;
-    job.status = "running";
-    job.started_at = new Date().toISOString();
-    await persistQueue();
-    try {
-      await runMigrationJob(job);
-      job.status = "done";
-    } catch (e) {
-      console.error(`[queue] Job ${job.id} failed:`, e.message);
-      job.status = "failed";
-      job.error = e.message;
-    }
-    job.completed_at = new Date().toISOString();
-    recordJobCompletion(job);
-    // Remove from queue — persistQueue filters to active-only anyway
-    await persistQueue();
-  }
-}
-
-async function runMigrationJob(job) {
-  let tmpDir = null;
-
-  const sourceKeys = await listAllUploadKeys(SOURCE_BUCKET);
-  const destClipKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
-  const processedFilenames = new Set(destClipKeys.map((k) => path.basename(k)));
-
-  const unprocessed = sourceKeys.filter((k) => !processedFilenames.has(path.basename(k)));
-  const toProcess = unprocessed.slice(0, job.batch_size);
-
-  job.progress.total = toProcess.length;
-  job.progress.current = 0;
-  await persistQueue();
-
-  const allRecords = await getAllAirtableRecords(["source_url", "video_url", "thumbnail_url"]);
-  const recordBySourceUrl = new Map();
-  const recordByVideoUrl = new Map();
-  for (const rec of allRecords) {
-    if (rec.fields.source_url) recordBySourceUrl.set(String(rec.fields.source_url).trim(), rec.id);
-    if (rec.fields.video_url) recordByVideoUrl.set(String(rec.fields.video_url).trim(), rec.id);
-  }
-
-  const results = [];
-
-  for (const sourceKey of toProcess) {
-    tmpDir = null;
-    const filename = path.basename(sourceKey);
-    const basename = path.basename(sourceKey, path.extname(sourceKey));
-    const oldUrl = buildSourceUrl(sourceKey);
-    const newClipKey = `clips/${filename}`;
-    const newThumbKey = `thumbnails/${basename}.jpg`;
-    const newClipUrl = buildDestUrl(newClipKey);
-    const newThumbUrl = buildDestUrl(newThumbKey);
-
-    try {
-      const dl = await downloadToTempFile(oldUrl);
-      tmpDir = dl.tmpDir;
-      const stat = await fs.stat(dl.videoPath);
-      console.error(`[migrate] downloaded ${filename}: ${stat.size} bytes`);
-      const { clipPath, thumbPath } = await processVideoForStorage(dl.videoPath, tmpDir);
-
-      await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
-      await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
-
-      const existingBySource = recordBySourceUrl.get(oldUrl);
-      const existingByVideo = recordByVideoUrl.get(newClipUrl);
-
-      if (existingBySource) {
-        await updateAirtableRow({ recordId: existingBySource, fields: { video_url: newClipUrl, thumbnail_url: newThumbUrl } });
-        recordByVideoUrl.set(newClipUrl, existingBySource);
-        results.push({ filename, ok: true, action: "updated", airtableRecordId: existingBySource });
-      } else if (existingByVideo) {
-        await updateAirtableRow({ recordId: existingByVideo, fields: { source_url: oldUrl, thumbnail_url: newThumbUrl } });
-        recordBySourceUrl.set(oldUrl, existingByVideo);
-        results.push({ filename, ok: true, action: "source_linked", airtableRecordId: existingByVideo });
-      } else {
-        const rec = await createAirtableRow({ sourceUrl: oldUrl, videoUrl: newClipUrl, thumbnailUrl: newThumbUrl, status: "uploaded" });
-        recordBySourceUrl.set(oldUrl, rec.id);
-        recordByVideoUrl.set(newClipUrl, rec.id);
-        results.push({ filename, ok: true, action: "created", airtableRecordId: rec.id });
-      }
-    } catch (err) {
-      console.error("Migration failed for:", sourceKey, err);
-      results.push({ filename, ok: false, error: err.message });
-    } finally {
-      if (tmpDir) {
-        try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
-        tmpDir = null;
-      }
-    }
-
-    job.progress.current++;
-    await persistQueue();
-  }
-
-  const processed = results.filter((r) => r.ok).length;
-  const failed = results.filter((r) => !r.ok).length;
-  job.summary = {
-    source_total: sourceKeys.length,
-    already_processed: sourceKeys.length - unprocessed.length,
-    processed,
-    failed,
-    remaining: Math.max(0, unprocessed.length - toProcess.length),
-  };
 }
 
 function buildPublicUrl(baseUrl, key) {
@@ -351,10 +148,6 @@ function buildPublicUrl(baseUrl, key) {
 
 function buildDestUrl(key) {
   return buildPublicUrl(R2_PUBLIC_BASE_URL, key);
-}
-
-function buildSourceUrl(key) {
-  return buildPublicUrl(SOURCE_PUBLIC_URL, key);
 }
 
 // ── FFmpeg helpers ────────────────────────────────────────────────────────────
@@ -482,21 +275,27 @@ async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
 
 // ── OpenAI ────────────────────────────────────────────────────────────────────
 
-async function getNotionPrompt() {
-  if (!NOTION_API_KEY) throw new Error("Missing env var: NOTION_API_KEY");
-  if (!NOTION_PAGE_ID) throw new Error("Missing env var: NOTION_PAGE_ID");
+async function getTaggingPromptText() {
+  const bucket = process.env.R2_CONFIG_BUCKET_NAME || "config";
+  const resp = await r2.send(new GetObjectCommand({ Bucket: bucket, Key: "prompts/tagging.json" }));
+  const data = JSON.parse(await resp.Body.transformToString());
 
-  const page = await notion.pages.retrieve({ page_id: NOTION_PAGE_ID });
-  const prop = page?.properties?.Prompt;
-  const textParts =
-    prop?.type === "title"
-      ? prop.title
-      : prop?.type === "rich_text"
-      ? prop.rich_text
-      : null;
-
-  if (!textParts) return `[Prompt property type "${prop?.type ?? "unknown"}" not supported]`;
-  return textParts.map((t) => t.plain_text).join("").trim() || "[Prompt is empty]";
+  const lines = [];
+  if (data.role_block) lines.push(data.role_block, "");
+  if (data.parameter_instructions) {
+    lines.push("Field instructions:");
+    for (const [key, instruction] of Object.entries(data.parameter_instructions)) {
+      lines.push(`${key}: ${instruction}`);
+    }
+    lines.push("");
+  }
+  if (data.sequence_rules?.length) {
+    lines.push("Rules:");
+    for (const rule of data.sequence_rules) lines.push(`- ${rule}`);
+    lines.push("");
+  }
+  if (data.goal) lines.push(`Goal: ${data.goal}`);
+  return lines.join("\n");
 }
 
 async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
@@ -505,18 +304,7 @@ async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
   const content = [
     {
       type: "input_text",
-      text:
-        `Analyze this stock video for retrieval.\n` +
-        `VIDEO_URL: ${videoUrl}\n\n` +
-        `PROMPT:\n${promptText}\n\n` +
-        `Return JSON ONLY with keys:\n` +
-        `emotional_tone (array)\n` +
-        `energy (string)\n` +
-        `visual_style (array)\n` +
-        `context (array)\n` +
-        `human_presence (string)\n` +
-        `lighting (array)\n` +
-        `color_mood (array)\n`,
+      text: `VIDEO_URL: ${videoUrl}\n\n${promptText}`,
     },
     ...framesBase64.map((b64) => ({
       type: "input_image",
@@ -556,119 +344,66 @@ function toText(val) {
   return String(val).trim();
 }
 
-// ── Airtable helpers ──────────────────────────────────────────────────────────
+// ── Supabase helpers ──────────────────────────────────────────────────────────
 
-function airtableUrl(path = "") {
-  return `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_NAME)}${path}`;
+async function createSupabaseAsset({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "processing" }) {
+  const { data, error } = await supabase
+    .from("assets")
+    .insert({
+      video_url: videoUrl,
+      thumbnail_url: thumbnailUrl || null,
+      source_url: sourceUrl || null,
+      status,
+      ingested_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+  if (error) throw new Error(`Supabase create error: ${error.message}`);
+  return data; // { id }
 }
 
-function airtableHeaders() {
-  return {
-    Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-    "Content-Type": "application/json",
-  };
+async function updateSupabaseStatus(assetId, status, extraFields = {}) {
+  const { error } = await supabase
+    .from("assets")
+    .update({ status, ...extraFields })
+    .eq("id", assetId);
+  if (error) throw new Error(`Supabase status update error: ${error.message}`);
 }
 
-async function createAirtableRow({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "processing" }) {
-  const body = {
-    records: [
-      {
-        fields: {
-          ...(sourceUrl ? { source_url: toText(sourceUrl) } : {}),
-          video_url: toText(videoUrl),
-          ...(thumbnailUrl ? { thumbnail_url: toText(thumbnailUrl) } : {}),
-          status,
-        },
-      },
-    ],
-  };
+async function upsertSupabaseTags(assetId, tagsObj, model = "gpt-4o-mini") {
+  await supabase
+    .from("asset_tags")
+    .update({ is_current: false })
+    .eq("asset_id", assetId)
+    .eq("is_current", true);
 
-  const resp = await fetch(airtableUrl(), {
-    method: "POST",
-    headers: airtableHeaders(),
-    body: JSON.stringify(body),
-  });
-
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`Airtable create error: ${resp.status} ${JSON.stringify(data)}`);
-  return data?.records?.[0];
+  const { error } = await supabase
+    .from("asset_tags")
+    .insert({
+      asset_id: assetId,
+      tags: tagsObj,
+      tagged_with_params: Object.keys(tagsObj),
+      tagged_by: model,
+      is_current: true,
+      tagged_at: new Date().toISOString(),
+    });
+  if (error) throw new Error(`Supabase tags insert error: ${error.message}`);
 }
 
-async function updateAirtableRow({ recordId, fields }) {
-  const body = { records: [{ id: recordId, fields }] };
-  const resp = await fetch(airtableUrl(), {
-    method: "PATCH",
-    headers: airtableHeaders(),
-    body: JSON.stringify(body),
-  });
-
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`Airtable update error: ${resp.status} ${JSON.stringify(data)}`);
-  return data?.records?.[0];
-}
-
-async function getAirtableRecord(recordId) {
-  const resp = await fetch(airtableUrl(`/${recordId}`), {
-    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
-  });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(`Airtable get error: ${resp.status} ${JSON.stringify(data)}`);
+async function getSupabaseAsset(assetId) {
+  const { data, error } = await supabase
+    .from("assets")
+    .select("id, video_url, thumbnail_url, source_url, status")
+    .eq("id", assetId)
+    .single();
+  if (error) throw new Error(`Supabase get error: ${error.message}`);
   return data;
 }
 
-// Returns all records as array of { id, fields }
-async function getAllAirtableRecords(fieldsToFetch = []) {
-  const records = [];
-  let offset;
-
-  while (true) {
-    const url = new URL(airtableUrl());
-    url.searchParams.set("pageSize", "100");
-    for (const f of fieldsToFetch) url.searchParams.append("fields[]", f);
-    if (offset) url.searchParams.set("offset", offset);
-
-    const resp = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(`Airtable list error: ${resp.status} ${JSON.stringify(data)}`);
-
-    for (const rec of data.records || []) {
-      records.push({ id: rec.id, fields: rec.fields });
-    }
-
-    if (!data.offset) break;
-    offset = data.offset;
-  }
-
-  return records;
-}
-
-async function getAllAirtableVideoUrls() {
-  const records = await getAllAirtableRecords(["video_url"]);
-  return records
-    .map((r) => String(r.fields.video_url || "").trim())
-    .filter(Boolean);
-}
-
-// ── Status determination ──────────────────────────────────────────────────────
-
-function computeStatus(fields) {
-  const current = String(fields.status || "").toLowerCase();
-  if (current === "processing") return null;
-
-  function isFilled(val) {
-    if (Array.isArray(val)) return val.length > 0;
-    return val != null && String(val).trim().length > 0;
-  }
-
-  const allFilled = [...TAG_FIELDS, "video_url", "thumbnail_url", "source_url"]
-    .every((f) => isFilled(fields[f]));
-
-  if (allFilled)                          return "tagged";
-  if (isFilled(fields.short_description)) return "incomplete";
-  if (isFilled(fields.video_url))         return "uploaded";
-  return null;
+async function getAllSupabaseVideoUrls() {
+  const { data, error } = await supabase.from("assets").select("video_url");
+  if (error) throw new Error(`Supabase list error: ${error.message}`);
+  return (data || []).map((r) => String(r.video_url || "").trim()).filter(Boolean);
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -680,7 +415,7 @@ app.post("/webhook", async (_req, res) => {
   let tmpDir = null;
 
   try {
-    const promptText = await getNotionPrompt();
+    const promptText = await getTaggingPromptText();
 
     const allKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
     if (!allKeys.length) {
@@ -688,7 +423,7 @@ app.post("/webhook", async (_req, res) => {
     }
 
     const allUrls = allKeys.map((k) => buildDestUrl(k));
-    const existingUrls = await getAllAirtableVideoUrls();
+    const existingUrls = await getAllSupabaseVideoUrls();
     const existingSet = new Set(existingUrls);
     const newUrls = allUrls.filter((u) => !existingSet.has(u));
 
@@ -707,7 +442,7 @@ app.post("/webhook", async (_req, res) => {
         const basename = clipKey ? path.basename(clipKey, path.extname(clipKey)) : null;
         const thumbnailUrl = basename ? buildDestUrl(`thumbnails/${basename}.jpg`) : "";
 
-        airtableRecord = await createAirtableRow({ videoUrl, thumbnailUrl, status: "processing" });
+        airtableRecord = await createSupabaseAsset({ videoUrl, thumbnailUrl, status: "processing" });
         const recordId = airtableRecord.id;
 
         const dl = await downloadToTempFile(videoUrl);
@@ -718,26 +453,24 @@ app.post("/webhook", async (_req, res) => {
         framesBase64.length = 0;
 
         const tagsObj = safeJsonFromText(analysisText);
-        const updateFields = { status: "tagged" };
+        const cleanTags = {};
         for (const [key, value] of Object.entries(tagsObj || {})) {
           const text = toText(value);
-          if (text) updateFields[key] = text;
+          if (text) cleanTags[key] = text;
         }
 
-        await updateAirtableRow({ recordId, fields: updateFields });
+        await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
+        await updateSupabaseStatus(recordId, "tagged", { processed_at: new Date().toISOString() });
 
-        results.push({ videoUrl, ok: true, parsed: tagsObj, airtableRecordId: recordId });
+        results.push({ videoUrl, ok: true, parsed: tagsObj, assetId: recordId });
       } catch (err) {
         console.error("Failed processing:", videoUrl, err);
         if (airtableRecord?.id) {
           try {
-            await updateAirtableRow({
-              recordId: airtableRecord.id,
-              fields: { status: "failed", error_message: String(err.message).slice(0, 1000) },
-            });
+            await updateSupabaseStatus(airtableRecord.id, "failed");
           } catch {}
         }
-        results.push({ videoUrl, ok: false, airtableRecordId: airtableRecord?.id || null, error: err.message });
+        results.push({ videoUrl, ok: false, assetId: airtableRecord?.id || null, error: err.message });
       } finally {
         if (tmpDir) {
           try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
@@ -749,7 +482,7 @@ app.post("/webhook", async (_req, res) => {
     return res.json({
       ok: true,
       r2_total: allKeys.length,
-      airtable_existing: existingUrls.length,
+      supabase_existing: existingUrls.length,
       new_found: newUrls.length,
       processed_now: toProcess.length,
       remaining_new: Math.max(0, newUrls.length - toProcess.length),
@@ -761,148 +494,19 @@ app.post("/webhook", async (_req, res) => {
   }
 });
 
-// POST /migrate — queue a migration job and return immediately
-app.post("/migrate", async (req, res) => {
-  if (!SOURCE_BUCKET) return res.status(400).json({ ok: false, error: "SOURCE_BUCKET env var not set" });
-  if (!SOURCE_PUBLIC_URL) return res.status(400).json({ ok: false, error: "SOURCE_PUBLIC_URL env var not set" });
-
-  const queued = jobQueue.filter((j) => j.status === "queued");
-  if (queued.length >= 5) {
-    return res.status(409).json({ ok: false, error: "Queue is full (max 5 pending jobs)" });
-  }
-
-  const job = {
-    id: `migrate_${Date.now()}`,
-    type: "migrate",
-    status: "queued",
-    created_at: new Date().toISOString(),
-    started_at: null,
-    completed_at: null,
-    batch_size: Number(req.body?.batch_size || process.env.MIGRATE_BATCH_LIMIT || 5),
-    progress: { current: 0, total: 0 },
-    summary: null,
-    error: null,
-  };
-
-  jobQueue.push(job);
-  await persistQueue();
-  startWorker();
-
-  return res.json({ ok: true, jobId: job.id });
-});
-
-// GET /queue — return active jobs + completion status + auto-removed summary
-app.get("/queue", (_req, res) => {
-  const activeJobs = jobQueue.filter((j) => ["queued", "running"].includes(j.status));
-  return res.json({ ok: true, jobs: activeJobs, lastCompletion, autoRemoved });
-});
-
-// POST /queue/reset — reset any stuck "running" jobs back to "queued" and resume the worker.
-// Use this after a crash where the service restarted but initQueue didn't run cleanly,
-// or when you want to force-retry without a full Render restart.
-app.post("/queue/reset", async (req, res) => {
-  const reset = [];
-  for (const job of jobQueue) {
-    if (job.status === "running") {
-      job.status = "queued";
-      job.started_at = null;
-      job.progress.current = 0;
-      reset.push(job.id);
-    }
-  }
-  await persistQueue();
-  if (jobQueue.some((j) => j.status === "queued")) startWorker();
-  return res.json({ ok: true, reset });
-});
-
-// POST /queue/clear — remove all queued and running jobs entirely.
-app.post("/queue/clear", async (req, res) => {
-  const cleared = jobQueue.filter((j) => ["queued", "running"].includes(j.status)).map((j) => j.id);
-  jobQueue = jobQueue.filter((j) => !["queued", "running"].includes(j.status));
-  await persistQueue();
-  return res.json({ ok: true, cleared });
-});
-
-// DELETE /queue/:jobId — remove a queued job
-app.delete("/queue/:jobId", async (req, res) => {
-  const idx = jobQueue.findIndex((j) => j.id === req.params.jobId);
-  if (idx === -1) return res.status(404).json({ ok: false, error: "Job not found" });
-  if (jobQueue[idx].status !== "queued") {
-    return res.status(409).json({ ok: false, error: `Cannot cancel a ${jobQueue[idx].status} job` });
-  }
-  jobQueue.splice(idx, 1);
-  await persistQueue();
-  return res.json({ ok: true, jobId: req.params.jobId });
-});
-
-// POST /queue/dismiss-completion — user dismissed the completion status message
-app.post("/queue/dismiss-completion", async (_req, res) => {
-  lastCompletion = null;
-  await persistQueue();
-  return res.json({ ok: true });
-});
-
-// POST /queue/dismiss-auto-removed — user dismissed the auto-removed summary
-app.post("/queue/dismiss-auto-removed", async (_req, res) => {
-  autoRemoved = null;
-  await persistQueue();
-  return res.json({ ok: true });
-});
-
-// POST /sync-statuses — recalculate status for all records based on tag field completeness
-app.post("/sync-statuses", async (_req, res) => {
-  try {
-    const allRecords = await getAllAirtableRecords(["video_url", "thumbnail_url", "source_url", "status", ...TAG_FIELDS]);
-
-    let updated = 0;
-    let skipped = 0;
-
-    // Batch updates (Airtable allows up to 10 per PATCH)
-    const batchSize = 10;
-    const updates = [];
-
-    for (const rec of allRecords) {
-      const newStatus = computeStatus(rec.fields);
-      if (newStatus === null || newStatus === rec.fields.status) {
-        skipped++;
-        continue;
-      }
-      updates.push({ id: rec.id, fields: { status: newStatus } });
-    }
-
-    for (let i = 0; i < updates.length; i += batchSize) {
-      const batch = updates.slice(i, i + batchSize);
-      const body = { records: batch };
-      const resp = await fetch(airtableUrl(), {
-        method: "PATCH",
-        headers: airtableHeaders(),
-        body: JSON.stringify(body),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(`Airtable batch update error: ${resp.status} ${JSON.stringify(data)}`);
-      updated += batch.length;
-    }
-
-    return res.json({ ok: true, total: allRecords.length, updated, skipped });
-  } catch (e) {
-    console.error("Sync statuses error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // POST /retag/:recordId — re-run AI tagging on a specific clip
 app.post("/retag/:recordId", async (req, res) => {
   let tmpDir = null;
 
   try {
     const { recordId } = req.params;
-    const rec = await getAirtableRecord(recordId);
-    const videoUrl = rec?.fields?.video_url;
-    if (!videoUrl) return res.status(400).json({ ok: false, error: "Record has no video_url" });
+    const asset = await getSupabaseAsset(recordId);
+    const videoUrl = asset?.video_url;
+    if (!videoUrl) return res.status(400).json({ ok: false, error: "Asset has no video_url" });
 
-    const promptText = await getNotionPrompt();
+    const promptText = await getTaggingPromptText();
 
-    await updateAirtableRow({ recordId, fields: { status: "processing" } });
+    await updateSupabaseStatus(recordId, "processing");
 
     const dl = await downloadToTempFile(videoUrl);
     tmpDir = dl.tmpDir;
@@ -912,24 +516,20 @@ app.post("/retag/:recordId", async (req, res) => {
     framesBase64.length = 0;
 
     const tagsObj = safeJsonFromText(analysisText);
-    const updateFields = { status: "tagged" };
+    const cleanTags = {};
     for (const [key, value] of Object.entries(tagsObj || {})) {
       const text = toText(value);
-      if (text) updateFields[key] = text;
+      if (text) cleanTags[key] = text;
     }
 
-    await updateAirtableRow({ recordId, fields: updateFields });
+    await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
+    await updateSupabaseStatus(recordId, "tagged", { processed_at: new Date().toISOString() });
 
-    return res.json({ ok: true, airtableRecordId: recordId, parsed: tagsObj });
+    return res.json({ ok: true, assetId: recordId, parsed: tagsObj });
   } catch (e) {
     console.error("Retag error:", e);
     if (req.params.recordId) {
-      try {
-        await updateAirtableRow({
-          recordId: req.params.recordId,
-          fields: { status: "failed", error_message: String(e.message).slice(0, 1000) },
-        });
-      } catch {}
+      try { await updateSupabaseStatus(req.params.recordId, "failed"); } catch {}
     }
     return res.status(500).json({ ok: false, error: e.message });
   } finally {
@@ -968,7 +568,7 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
     const newClipUrl = buildDestUrl(newClipKey);
     const newThumbUrl = buildDestUrl(newThumbKey);
 
-    const rec = await createAirtableRow({
+    const rec = await createSupabaseAsset({
       videoUrl: newClipUrl,
       thumbnailUrl: newThumbUrl,
       status: "uploaded",
@@ -976,7 +576,7 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
 
     return res.json({
       ok: true,
-      airtableRecordId: rec.id,
+      assetId: rec.id,
       video_url: newClipUrl,
       thumbnail_url: newThumbUrl,
     });
@@ -994,7 +594,6 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, async () => {
+app.listen(port, () => {
   console.log(`Tagging service listening on port ${port}`);
-  await initQueue();
 });
