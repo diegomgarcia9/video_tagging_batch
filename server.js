@@ -84,6 +84,7 @@ const upload = multer({
 
 // ── Tag fields used to determine completeness ────────────────────────────────
 const TAG_FIELDS = [
+  "short_description",
   "emotional_tone",
   "energy_level",
   "visual_style",
@@ -95,7 +96,15 @@ const TAG_FIELDS = [
   "pace",
   "narrative_function",
   "visual_medium",
-  "short_description",
+  "camera_behavior",
+  "shot_type",
+  "movement_type",
+  "keywords",
+  "interaction_type",
+  "action_type",
+  "emotional_valence",
+  "psychological_state",
+  "emotional_intensity",
 ];
 
 // ── R2 helpers ───────────────────────────────────────────────────────────────
@@ -299,29 +308,25 @@ async function getTaggingPromptText() {
 }
 
 async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
-  const model = OPENAI_VISION_MODEL || "gpt-4.1-mini";
+  const model = OPENAI_VISION_MODEL || "gpt-4o-mini";
 
   const content = [
     {
-      type: "input_text",
+      type: "text",
       text: `VIDEO_URL: ${videoUrl}\n\n${promptText}`,
     },
     ...framesBase64.map((b64) => ({
-      type: "input_image",
-      image_url: `data:image/jpeg;base64,${b64}`,
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${b64}` },
     })),
   ];
 
-  const resp = await openai.responses.create({
+  const resp = await openai.chat.completions.create({
     model,
-    input: [{ role: "user", content }],
+    messages: [{ role: "user", content }],
   });
 
-  return (
-    resp.output_text ||
-    resp.output?.[0]?.content?.map((c) => c.text).join("") ||
-    ""
-  );
+  return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
 function safeJsonFromText(text) {
@@ -346,7 +351,16 @@ function toText(val) {
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 
-async function createSupabaseAsset({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "processing" }) {
+function computeTagStatus(tags) {
+  const present = TAG_FIELDS.filter((f) => {
+    const v = tags[f];
+    return Array.isArray(v) ? v.length > 0 : Boolean(v);
+  });
+  if (present.length === 0) return "processed";
+  return present.length === TAG_FIELDS.length ? "tagged" : "incomplete";
+}
+
+async function createSupabaseAsset({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "ingested" }) {
   const { data, error } = await supabase
     .from("assets")
     .insert({
@@ -442,7 +456,7 @@ app.post("/webhook", async (_req, res) => {
         const basename = clipKey ? path.basename(clipKey, path.extname(clipKey)) : null;
         const thumbnailUrl = basename ? buildDestUrl(`thumbnails/${basename}.jpg`) : "";
 
-        airtableRecord = await createSupabaseAsset({ videoUrl, thumbnailUrl, status: "processing" });
+        airtableRecord = await createSupabaseAsset({ videoUrl, thumbnailUrl, status: "tagging" });
         const recordId = airtableRecord.id;
 
         const dl = await downloadToTempFile(videoUrl);
@@ -460,14 +474,15 @@ app.post("/webhook", async (_req, res) => {
         }
 
         await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
-        await updateSupabaseStatus(recordId, "tagged", { processed_at: new Date().toISOString() });
+        const tagStatus = computeTagStatus(cleanTags);
+        await updateSupabaseStatus(recordId, tagStatus, { processed_at: new Date().toISOString() });
 
         results.push({ videoUrl, ok: true, parsed: tagsObj, assetId: recordId });
       } catch (err) {
         console.error("Failed processing:", videoUrl, err);
         if (airtableRecord?.id) {
           try {
-            await updateSupabaseStatus(airtableRecord.id, "failed");
+            await updateSupabaseStatus(airtableRecord.id, "failed_tagging");
           } catch {}
         }
         results.push({ videoUrl, ok: false, assetId: airtableRecord?.id || null, error: err.message });
@@ -506,7 +521,7 @@ app.post("/retag/:recordId", async (req, res) => {
 
     const promptText = await getTaggingPromptText();
 
-    await updateSupabaseStatus(recordId, "processing");
+    await updateSupabaseStatus(recordId, "tagging");
 
     const dl = await downloadToTempFile(videoUrl);
     tmpDir = dl.tmpDir;
@@ -523,13 +538,14 @@ app.post("/retag/:recordId", async (req, res) => {
     }
 
     await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
-    await updateSupabaseStatus(recordId, "tagged", { processed_at: new Date().toISOString() });
+    const tagStatus = computeTagStatus(cleanTags);
+    await updateSupabaseStatus(recordId, tagStatus, { processed_at: new Date().toISOString() });
 
     return res.json({ ok: true, assetId: recordId, parsed: tagsObj });
   } catch (e) {
     console.error("Retag error:", e);
     if (req.params.recordId) {
-      try { await updateSupabaseStatus(req.params.recordId, "failed"); } catch {}
+      try { await updateSupabaseStatus(req.params.recordId, "failed_tagging"); } catch {}
     }
     return res.status(500).json({ ok: false, error: e.message });
   } finally {
@@ -556,8 +572,23 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
     const newClipKey = `clips/${clipFilename}`;
     const newThumbKey = `thumbnails/${thumbFilename}`;
 
+    // Create asset record immediately so the clip is visible in the UI
+    const newClipUrl = buildDestUrl(newClipKey);
+    const newThumbUrl = buildDestUrl(newThumbKey);
+    const rec = await createSupabaseAsset({
+      videoUrl: newClipUrl,
+      thumbnailUrl: newThumbUrl,
+      status: "ingested",
+    });
+
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "upload-"));
-    const { clipPath, thumbPath } = await processVideoForStorage(uploadedPath, tmpDir);
+    let clipPath, thumbPath;
+    try {
+      ({ clipPath, thumbPath } = await processVideoForStorage(uploadedPath, tmpDir));
+    } catch (procErr) {
+      await updateSupabaseStatus(rec.id, "failed_processing");
+      throw procErr;
+    }
 
     // Delete source upload before streaming processed files to R2
     try { await fs.unlink(uploadedPath); } catch {}
@@ -565,14 +596,7 @@ app.post("/upload", upload.single("clip"), async (req, res) => {
     await uploadFileToR2(R2_BUCKET_NAME, newClipKey, clipPath, "video/mp4");
     await uploadFileToR2(R2_BUCKET_NAME, newThumbKey, thumbPath, "image/jpeg");
 
-    const newClipUrl = buildDestUrl(newClipKey);
-    const newThumbUrl = buildDestUrl(newThumbKey);
-
-    const rec = await createSupabaseAsset({
-      videoUrl: newClipUrl,
-      thumbnailUrl: newThumbUrl,
-      status: "uploaded",
-    });
+    await updateSupabaseStatus(rec.id, "processed", { processed_at: new Date().toISOString() });
 
     return res.json({
       ok: true,
