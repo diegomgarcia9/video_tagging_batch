@@ -284,37 +284,62 @@ async function extractFramesBase64(videoPath, { fps = 1, maxFrames = 4 } = {}) {
 
 // ── OpenAI ────────────────────────────────────────────────────────────────────
 
-async function getTaggingPromptText() {
-  const bucket = process.env.R2_CONFIG_BUCKET_NAME || "config";
-  const resp = await r2.send(new GetObjectCommand({ Bucket: bucket, Key: "prompts/tagging.json" }));
-  const data = JSON.parse(await resp.Body.transformToString());
-
-  const lines = [];
-  if (data.role_block) lines.push(data.role_block, "");
-  if (data.parameter_instructions) {
-    lines.push("Field instructions:");
-    for (const [key, instruction] of Object.entries(data.parameter_instructions)) {
-      lines.push(`${key}: ${instruction}`);
-    }
-    lines.push("");
+async function getParameters() {
+  try {
+    const bucket = process.env.R2_CONFIG_BUCKET_NAME || "config";
+    const resp = await r2.send(new GetObjectCommand({ Bucket: bucket, Key: "parameters.json" }));
+    const data = JSON.parse(await resp.Body.transformToString());
+    return (data.parameters || []).filter((p) => !p.hidden);
+  } catch {
+    return [];
   }
-  if (data.sequence_rules?.length) {
-    lines.push("Rules:");
-    for (const rule of data.sequence_rules) lines.push(`- ${rule}`);
-    lines.push("");
-  }
-  if (data.goal) lines.push(`Goal: ${data.goal}`);
-  return lines.join("\n");
 }
 
-async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
+async function getTaggingPromptText(videoUrl, parameters) {
+  const bucket = process.env.R2_CONFIG_BUCKET_NAME || "config";
+  const resp = await r2.send(new GetObjectCommand({ Bucket: bucket, Key: "prompts/tagging.json" }));
+  const p = JSON.parse(await resp.Body.transformToString());
+
+  function countLabel(param) {
+    if (!param || param.input_type === "text") return "";
+    if (param.input_type === "single") return "Single value.";
+    if (param.min_count != null && param.max_count != null) return `${param.min_count}–${param.max_count} values.`;
+    return "";
+  }
+
+  const instrLines = Object.entries(p.parameter_instructions || {}).map(([k, v]) => {
+    const param = parameters.find((pr) => pr.name === k);
+    const count = countLabel(param);
+    const allowed = param?.allowed_values?.length
+      ? `\n  Allowed: [${param.allowed_values.map((av) => `"${av}"`).join(", ")}]`
+      : "";
+    const instruction = [count, v].filter(Boolean).join(" ");
+    return `${k}: ${instruction}${allowed}`;
+  }).join("\n\n");
+
+  const seqRules = (p.sequence_rules || []).map((r, i) => `${i + 1}. ${r}`).join("\n");
+
+  const schemaEntries = parameters.length
+    ? parameters.map((pr) => `  "${pr.name}": ${pr.input_type === "array" ? "[]" : '""'}`).join(",\n")
+    : Object.keys(p.parameter_instructions || {}).map((k) => `  "${k}": ""`).join(",\n");
+
+  return [
+    p.role_block || "",
+    instrLines ? `\nInstructions per field:\n\n${instrLines}` : "",
+    seqRules ? `\nFormatting rules:\n${seqRules}` : "",
+    p.goal ? `\nGoal: ${p.goal}` : "",
+    "\n---",
+    `VIDEO_URL: ${videoUrl}`,
+    "[Frames attached as images]",
+    `\n// Schema — fill every key, follow allowed values exactly:\n{\n${schemaEntries}\n}`,
+  ].filter(Boolean).join("\n");
+}
+
+async function analyzeVideoWithOpenAI({ promptText, framesBase64 }) {
   const model = OPENAI_VISION_MODEL || "gpt-4o-mini";
 
   const content = [
-    {
-      type: "text",
-      text: `VIDEO_URL: ${videoUrl}\n\n${promptText}`,
-    },
+    { type: "text", text: promptText },
     ...framesBase64.map((b64) => ({
       type: "image_url",
       image_url: { url: `data:image/jpeg;base64,${b64}` },
@@ -323,41 +348,157 @@ async function analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl }) {
 
   const resp = await openai.chat.completions.create({
     model,
-    messages: [{ role: "user", content }],
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are a video clip tagger. Return only valid JSON matching the schema exactly." },
+      { role: "user", content },
+    ],
   });
 
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function safeJsonFromText(text) {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("OpenAI output did not contain a JSON object");
-  }
-  const cleaned = text
-    .slice(start, end + 1)
-    .split("\n")
-    .filter((line) => line.trim() !== "Menu")
-    .join("\n");
-  return JSON.parse(cleaned);
+async function correctTagResponseWithOpenAI(feedbackPrompt) {
+  const model = OPENAI_VISION_MODEL || "gpt-4o-mini";
+  const resp = await openai.chat.completions.create({
+    model,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are a JSON corrector. Return only valid JSON matching the schema." },
+      { role: "user", content: feedbackPrompt },
+    ],
+  });
+  return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function toText(val) {
-  if (Array.isArray(val)) return val.map(String).filter(Boolean).join(", ");
-  if (val === null || val === undefined) return "";
-  return String(val).trim();
+function validateTagResponse({ tagsObj, parameters }) {
+  const errors = [];
+  for (const param of parameters) {
+    const { name, input_type, allowed_values, min_count, max_count } = param;
+    const val = tagsObj[name];
+
+    if (name === "short_description") {
+      if (!val || typeof val !== "string" || !val.trim()) {
+        errors.push({ field: name, message: "short_description must be a non-empty string." });
+      } else {
+        const words = val.trim().split(/\s+/);
+        if (words.length > 12) {
+          errors.push({ field: name, message: `short_description must be max 12 words (got ${words.length}).` });
+        }
+      }
+      continue;
+    }
+
+    if (input_type === "array") {
+      const arr = Array.isArray(val) ? val : (typeof val === "string" && val ? [val] : []);
+      const min = min_count ?? 1;
+      const max = max_count ?? 10;
+      if (arr.length < min || arr.length > max) {
+        errors.push({ field: name, message: `${name} must contain ${min}–${max} values (got ${arr.length}).` });
+      }
+      if (allowed_values?.length) {
+        for (const item of arr) {
+          if (!allowed_values.includes(item)) {
+            errors.push({ field: name, message: `${name} contains invalid value "${item}". Allowed: ${allowed_values.join(", ")}` });
+          }
+        }
+      }
+    } else {
+      if (!val || typeof val !== "string" || !val.trim()) {
+        errors.push({ field: name, message: `${name} must be a non-empty string.` });
+      } else if (allowed_values?.length && !allowed_values.includes(val)) {
+        errors.push({ field: name, message: `${name} contains invalid value "${val}". Allowed: ${allowed_values.join(", ")}` });
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+function buildTaggingFeedback({ errors, previousResponse }) {
+  const byField = {};
+  for (const e of errors) {
+    if (!byField[e.field]) byField[e.field] = [];
+    byField[e.field].push(e.message);
+  }
+  const fieldErrors = Object.entries(byField)
+    .map(([field, msgs]) => `- ${field}: ${msgs.join("; ")}`)
+    .join("\n");
+  return [
+    "Your previous response failed validation.",
+    "",
+    "Fix the JSON and return the corrected JSON only.",
+    "",
+    "Fields with errors:",
+    fieldErrors,
+    "",
+    "Here is your previous response. Correct it and return only the fixed JSON:",
+    previousResponse,
+  ].join("\n");
+}
+
+async function runTaggingWithRetry({ videoUrl, framesBase64, parameters }) {
+  const promptText = await getTaggingPromptText(videoUrl, parameters);
+  let responseText = "";
+  let tagsObj = null;
+  let validation = null;
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt === 1) {
+      responseText = await analyzeVideoWithOpenAI({ promptText, framesBase64 });
+    } else {
+      const feedbackPrompt = buildTaggingFeedback({ errors: validation.errors, previousResponse: responseText });
+      responseText = await correctTagResponseWithOpenAI(feedbackPrompt);
+    }
+
+    try {
+      tagsObj = JSON.parse(responseText);
+    } catch (e) {
+      validation = { ok: false, errors: [{ field: "json", message: `Invalid JSON: ${e.message}` }] };
+      continue;
+    }
+
+    validation = validateTagResponse({ tagsObj, parameters });
+    if (validation.ok) break;
+  }
+
+  return { tagsObj: tagsObj || {}, validation };
 }
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 
-function computeTagStatus(tags) {
-  const present = TAG_FIELDS.filter((f) => {
-    const v = tags[f];
+function computeTagStatus(tags, parameters) {
+  const visible = parameters.filter((p) => !p.hidden);
+  if (!visible.length) {
+    const hasAny = Object.values(tags).some((v) => Array.isArray(v) ? v.length > 0 : Boolean(v));
+    return hasAny ? "incomplete" : "processed";
+  }
+  const hasAny = visible.some((p) => {
+    const v = tags[p.name];
     return Array.isArray(v) ? v.length > 0 : Boolean(v);
   });
-  if (present.length === 0) return "processed";
-  return present.length === TAG_FIELDS.length ? "tagged" : "incomplete";
+  if (!hasAny) return "processed";
+
+  // Any filled field with an out-of-vocabulary value → invalid
+  const hasInvalid = visible.some((p) => {
+    if (!p.allowed_values?.length) return false;
+    const val = tags[p.name];
+    if (p.input_type === "array") {
+      const arr = Array.isArray(val) ? val : (typeof val === "string" && val ? [val] : []);
+      return arr.length > 0 && arr.some((item) => !p.allowed_values.includes(item));
+    }
+    if (p.input_type !== "text") {
+      return val && typeof val === "string" && !p.allowed_values.includes(val.trim());
+    }
+    return false;
+  });
+  if (hasInvalid) return "invalid";
+
+  const hasAll = visible.every((p) => {
+    const v = tags[p.name];
+    return Array.isArray(v) ? v.length > 0 : Boolean(v);
+  });
+  return hasAll ? "tagged" : "incomplete";
 }
 
 async function createSupabaseAsset({ videoUrl, thumbnailUrl = "", sourceUrl = "", status = "ingested" }) {
@@ -429,8 +570,7 @@ app.post("/webhook", async (_req, res) => {
   let tmpDir = null;
 
   try {
-    const promptText = await getTaggingPromptText();
-
+    const parameters = await getParameters();
     const allKeys = await listAllUploadKeys(R2_BUCKET_NAME, "clips/");
     if (!allKeys.length) {
       return res.status(404).json({ ok: false, error: "No clips found in bucket" });
@@ -463,21 +603,14 @@ app.post("/webhook", async (_req, res) => {
         tmpDir = dl.tmpDir;
 
         const framesBase64 = await extractFramesBase64(dl.videoPath);
-        const analysisText = await analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl });
+        const { tagsObj } = await runTaggingWithRetry({ videoUrl, framesBase64, parameters });
         framesBase64.length = 0;
 
-        const tagsObj = safeJsonFromText(analysisText);
-        const cleanTags = {};
-        for (const [key, value] of Object.entries(tagsObj || {})) {
-          const text = toText(value);
-          if (text) cleanTags[key] = text;
-        }
-
-        await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
-        const tagStatus = computeTagStatus(cleanTags);
+        await upsertSupabaseTags(recordId, tagsObj, OPENAI_VISION_MODEL || "gpt-4o-mini");
+        const tagStatus = computeTagStatus(tagsObj, parameters);
         await updateSupabaseStatus(recordId, tagStatus, { processed_at: new Date().toISOString() });
 
-        results.push({ videoUrl, ok: true, parsed: tagsObj, assetId: recordId });
+        results.push({ videoUrl, ok: true, tags: tagsObj, assetId: recordId });
       } catch (err) {
         console.error("Failed processing:", videoUrl, err);
         if (airtableRecord?.id) {
@@ -519,7 +652,7 @@ app.post("/retag/:recordId", async (req, res) => {
     const videoUrl = asset?.video_url;
     if (!videoUrl) return res.status(400).json({ ok: false, error: "Asset has no video_url" });
 
-    const promptText = await getTaggingPromptText();
+    const parameters = await getParameters();
 
     await updateSupabaseStatus(recordId, "tagging");
 
@@ -527,21 +660,14 @@ app.post("/retag/:recordId", async (req, res) => {
     tmpDir = dl.tmpDir;
 
     const framesBase64 = await extractFramesBase64(dl.videoPath);
-    const analysisText = await analyzeVideoWithOpenAI({ promptText, framesBase64, videoUrl });
+    const { tagsObj } = await runTaggingWithRetry({ videoUrl, framesBase64, parameters });
     framesBase64.length = 0;
 
-    const tagsObj = safeJsonFromText(analysisText);
-    const cleanTags = {};
-    for (const [key, value] of Object.entries(tagsObj || {})) {
-      const text = toText(value);
-      if (text) cleanTags[key] = text;
-    }
-
-    await upsertSupabaseTags(recordId, cleanTags, OPENAI_VISION_MODEL || "gpt-4o-mini");
-    const tagStatus = computeTagStatus(cleanTags);
+    await upsertSupabaseTags(recordId, tagsObj, OPENAI_VISION_MODEL || "gpt-4o-mini");
+    const tagStatus = computeTagStatus(tagsObj, parameters);
     await updateSupabaseStatus(recordId, tagStatus, { processed_at: new Date().toISOString() });
 
-    return res.json({ ok: true, assetId: recordId, parsed: tagsObj });
+    return res.json({ ok: true, assetId: recordId, tags: tagsObj });
   } catch (e) {
     console.error("Retag error:", e);
     if (req.params.recordId) {
@@ -552,6 +678,53 @@ app.post("/retag/:recordId", async (req, res) => {
     if (tmpDir) {
       try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
     }
+  }
+});
+
+// POST /sync-statuses — re-evaluate status for all tagged/incomplete/invalid assets
+app.post("/sync-statuses", async (_req, res) => {
+  try {
+    const parameters = await getParameters();
+
+    const { data: assets, error: listErr } = await supabase
+      .from("assets")
+      .select("id, status")
+      .in("status", ["tagged", "incomplete", "invalid"]);
+    if (listErr) throw new Error(`Supabase list error: ${listErr.message}`);
+
+    if (!assets.length) return res.json({ ok: true, checked: 0, updated: 0 });
+
+    const ids = assets.map((a) => a.id);
+    const { data: tagRows, error: tagsErr } = await supabase
+      .from("asset_tags")
+      .select("asset_id, tags")
+      .in("asset_id", ids)
+      .eq("is_current", true);
+    if (tagsErr) throw new Error(`Supabase tags error: ${tagsErr.message}`);
+
+    const tagMap = {};
+    for (const row of tagRows || []) tagMap[row.asset_id] = row.tags || {};
+
+    const byStatus = {};
+    let updatedCount = 0;
+    for (const asset of assets) {
+      const newStatus = computeTagStatus(tagMap[asset.id] || {}, parameters);
+      if (newStatus !== asset.status) {
+        if (!byStatus[newStatus]) byStatus[newStatus] = [];
+        byStatus[newStatus].push(asset.id);
+        updatedCount++;
+      }
+    }
+
+    for (const [status, statusIds] of Object.entries(byStatus)) {
+      const { error: upErr } = await supabase.from("assets").update({ status }).in("id", statusIds);
+      if (upErr) throw new Error(`Supabase update error: ${upErr.message}`);
+    }
+
+    return res.json({ ok: true, checked: assets.length, updated: updatedCount });
+  } catch (e) {
+    console.error("Sync-statuses error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
