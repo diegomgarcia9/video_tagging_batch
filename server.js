@@ -82,31 +82,6 @@ const upload = multer({
   limits: { fileSize: 500 * 1024 * 1024 },
 });
 
-// ── Tag fields used to determine completeness ────────────────────────────────
-const TAG_FIELDS = [
-  "short_description",
-  "emotional_tone",
-  "energy_level",
-  "visual_style",
-  "context",
-  "human_presence",
-  "lighting",
-  "color_mood",
-  "background",
-  "pace",
-  "narrative_function",
-  "visual_medium",
-  "camera_behavior",
-  "shot_type",
-  "movement_type",
-  "keywords",
-  "interaction_type",
-  "action_type",
-  "emotional_valence",
-  "psychological_state",
-  "emotional_intensity",
-];
-
 // ── R2 helpers ───────────────────────────────────────────────────────────────
 
 async function listAllUploadKeys(bucket, prefix = "") {
