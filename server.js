@@ -25,7 +25,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-import ffprobeStatic from "ffprobe-static";
 import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -556,7 +555,7 @@ app.post("/webhook", async (_req, res) => {
     const existingSet = new Set(existingUrls);
     const newUrls = allUrls.filter((u) => !existingSet.has(u));
 
-    const LIMIT = Number(process.env.BATCH_LIMIT || 10);
+    const LIMIT = Number(process.env.MIGRATE_BATCH_LIMIT || 10);
     const toProcess = [...newUrls].sort(() => Math.random() - 0.5).slice(0, LIMIT);
     const results = [];
 
